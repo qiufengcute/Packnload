@@ -1,4 +1,4 @@
-# Packnload
+# <img src="icon.ico" width="16" height="16" /> Packnload
 ![MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
 **一款轻量级、高效的 Minecraft Mod 批量下载工具**
