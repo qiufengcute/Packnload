@@ -406,11 +406,17 @@ class PacknloadEditor(QMainWindow):
 
         self.setStyleSheet(stylesheet)
 
-    def open_file(self):
+    def open_file(self, fp=None):
         """打开文件"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择 ModPack", "", "ModPack Files (*.modpack *.json);;All Files (*)"
-        )
+        if fp:
+            file_path = fp
+        else:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择 ModPack",
+                "",
+                "ModPack Files (*.modpack *.json);;All Files (*)",
+            )
 
         if not file_path:
             return
@@ -574,6 +580,10 @@ def main():
     app.setFont(font)
 
     window = PacknloadEditor()
+    if len(sys.argv) > 1:
+        fp = sys.argv[1]
+        if os.path.exists(fp):
+            window.open_file(fp)
     window.show()
 
     sys.exit(app.exec())
