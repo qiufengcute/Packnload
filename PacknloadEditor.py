@@ -61,7 +61,7 @@ class PacknloadEditor(QMainWindow):
         self.about_label = QLabel()
         self.about_label.setOpenExternalLinks(True)
         self.about_label.setText(
-            "<a href='https://www.yuque.com/qiufengqiufeng-qxav8/fgoums/okxkynz4oyx41kk6'>关于 Packnload</a>"
+            "<a href='https://qiufengcute.github.io/Blog/posts/Packnload/'>关于 Packnload</a>"
         )
         self.about_label.setAlignment(Qt.AlignCenter)
         font = QFont()
