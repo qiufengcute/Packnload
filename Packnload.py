@@ -1,18 +1,49 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
-import zipfile
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import zipfile
 
 import requests
+from PySide6.QtCore import (
+    Q_ARG,
+    QEventLoop,
+    QMetaObject,
+    QRect,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QFont, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 APP_TITLE = "Packnload"
 ICON_IMG = "icon.ico"
 BASE_URL = "https://api.modrinth.com/v2"
-UA = {"User-Agent": "Packnload/1.0 (+https://modrinth.com/)"}
+UA = {"User-Agent": "Packnload/1.1 (+https://modrinth.com/)"}
 
 
 # ---------- Modrinth API helpers ----------
@@ -46,11 +77,11 @@ def pick_primary_file(files: list):
     return files[0]
 
 
-def stream_download(url: str, dst_path: str, on_bytes=None, pause_event: threading.Event | None = None):
+def stream_download(url: str, dst_path: str, on_bytes=None, pause_event=None):
     """
     把远程文件流式下载到本地。
     on_bytes(inc_bytes, total_bytes or None) 用于进度回调。
-    pause_event 可选；若提供，则在每个 chunk 写入前 wait()，用于“暂停/继续”。
+    pause_event 可选；若提供，则在每个 chunk 写入前 wait()，用于"暂停/继续"。
     """
     with requests.get(url, stream=True, headers=UA, timeout=(10, 120)) as r:
         r.raise_for_status()
@@ -60,359 +91,225 @@ def stream_download(url: str, dst_path: str, on_bytes=None, pause_event: threadi
                 if not chunk:
                     continue
                 if pause_event is not None:
-                    pause_event.wait()  # 暂停控制：暂停中会在此处卡住
+                    pause_event.wait()
                 f.write(chunk)
                 if on_bytes:
                     on_bytes(len(chunk), total if total > 0 else None)
 
 
-# ---------- GUI ----------
-class App(tk.Tk):
-    def __init__(self):
+# ---------- Download Worker Thread ----------
+class DownloadWorker(QThread):
+    progress_updated = Signal(float)
+    status_updated = Signal(str)
+    download_finished = Signal(
+        bool, list, str, str
+    )  # success, fails, pack_name, pack_version
+    log_updated = Signal(str)
+
+    def __init__(self, modpack_path, game_version, loader, save_dir, zip_enabled):
         super().__init__()
-        self.title(APP_TITLE)
-        try:
-            self.iconbitmap(ICON_IMG)
-        except Exception:
-            pass
-        self.minsize(760, 420)
-        self.grid_columnconfigure(1, weight=1)
+        self.modpack_path = modpack_path
+        self.game_version = game_version
+        self.loader = loader
+        self.save_dir = save_dir
+        self.zip_enabled = zip_enabled
 
-        # 运行时状态
-        self.pack_data = None   # 已解析的 .modpack
-        self.total_mods = 0     # 总模组数
-        self.progress = 0.0     # 总进度
-
-        # 控制标志（新增）
         self.cancel_flag = False
         self.pause_event = threading.Event()
-        self.pause_event.set()  # 初始允许下载
-
-        # 保存按钮引用
-        self.start_btn = None
-        self.cancel_btn = None
-
-        self._build_ui()
-
-    def _build_ui(self):
-        # 大标题
-        title_lbl = ttk.Label(self, text=APP_TITLE, font=("Segoe UI", 20, "bold"))
-        title_lbl.grid(row=0, column=0, columnspan=3, pady=(14, 10))
-
-        # .modpack 路径选择
-        ttk.Label(self, text=".modpack 文件路径:").grid(row=1, column=0, sticky="e", padx=12, pady=6)
-        self.entry_modpack = ttk.Entry(self)
-        self.entry_modpack.grid(row=1, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Button(self, text="选择文件", command=self.choose_modpack).grid(row=1, column=2, padx=12, pady=6)
-
-        # 信息展示（名称/作者/版本）
-        info = ttk.Frame(self)
-        info.grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 6))
-        info.grid_columnconfigure(1, weight=1)
-
-        ttk.Label(info, text="名称:").grid(row=0, column=0, sticky="e")
-        self.lbl_name = ttk.Label(info, text="-")
-        self.lbl_name.grid(row=0, column=1, sticky="w", padx=6)
-
-        ttk.Label(info, text="作者:").grid(row=0, column=2, sticky="e", padx=(20, 0))
-        self.lbl_author = ttk.Label(info, text="-")
-        self.lbl_author.grid(row=0, column=3, sticky="w", padx=6)
-
-        ttk.Label(info, text="版本:").grid(row=0, column=4, sticky="e", padx=(20, 0))
-        self.lbl_version = ttk.Label(info, text="-")
-        self.lbl_version.grid(row=0, column=5, sticky="w", padx=6)
-
-        self.btn_view_list = ttk.Button(info, text="查看模组列表", command=self.view_mod_list, state="disabled")
-        self.btn_view_list.grid(row=0, column=6, padx=(20, 0))
-
-        # 游戏版本
-        ttk.Label(self, text="游戏版本:").grid(row=3, column=0, sticky="e", padx=12, pady=6)
-        self.entry_game_version = ttk.Entry(self)
-        self.entry_game_version.grid(row=3, column=1, sticky="ew", padx=6, pady=6)
-
-        # 加载器选择
-        ttk.Label(self, text="加载器:").grid(row=4, column=0, sticky="e", padx=12, pady=6)
-        self.loader_var = tk.StringVar()
-        self.combo_loader = ttk.Combobox(
-            self, textvariable=self.loader_var, state="readonly",
-            values=["fabric", "forge", "quilt", "neoforge"], width=12
-        )
-        self.combo_loader.current(0)
-        self.combo_loader.grid(row=4, column=1, sticky="w", padx=6, pady=6)
-
-        # 模组存储路径
-        ttk.Label(self, text="模组存储路径:").grid(row=5, column=0, sticky="e", padx=12, pady=6)
-        self.entry_save_dir = ttk.Entry(self)
-        self.entry_save_dir.grid(row=5, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Button(self, text="选择文件夹", command=self.choose_save_dir).grid(row=5, column=2, padx=12, pady=6)
-
-        # 是否打包 ZIP
-        self.zip_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self, text="是否打包 ZIP", variable=self.zip_var).grid(
-            row=6, column=1, sticky="w", padx=6, pady=(6, 2)
-        )
-
-        # 控制按钮：并排 & 居中
-        btn_frame = ttk.Frame(self)
-        btn_frame.grid(row=7, column=0, columnspan=3, pady=12)
-        self.start_btn = ttk.Button(btn_frame, text="开始下载", command=self.start_or_pause)
-        self.start_btn.pack(side="left", padx=10)
-        self.cancel_btn = ttk.Button(btn_frame, text="取消下载", command=self.cancel_download, state="disabled")
-        self.cancel_btn.pack(side="left", padx=10)
-
-        # 进度条
-        self.progress_var = tk.DoubleVar(value=0.0)
-        self.progressbar = ttk.Progressbar(
-            self, orient="horizontal", mode="determinate",
-            maximum=100.0, variable=self.progress_var, length=560
-        )
-        self.progressbar.grid(row=8, column=0, columnspan=3, pady=(6, 8))
-
-        # 状态栏
-        self.status = tk.StringVar(value="准备就绪")
-        ttk.Label(self, textvariable=self.status, foreground="#666").grid(
-            row=9, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 10)
-        )
-
-    # ---------- Actions ----------
-    def choose_modpack(self):
-        path = filedialog.askopenfilename(
-            title="选择 .modpack 文件",
-            filetypes=[("Modpack files", "*.modpack"), ("All files", "*.*")]
-        )
-        if not path:
-            return
-        self.entry_modpack.delete(0, tk.END)
-        self.entry_modpack.insert(0, path)
-        self.load_modpack_meta(path)
-
-    def load_modpack_meta(self, path: str):
-        """读取并展示模组包基本信息"""
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                pack = json.load(f)
-        except Exception:
-            self.pack_data = None
-            self.btn_view_list.config(state="disabled")
-            self.lbl_name.config(text="-")
-            self.lbl_author.config(text="-")
-            self.lbl_version.config(text="-")
-            messagebox.showerror("错误", "模组包格式错误！")
-            return
-
-        required = ["name", "author", "version", "mod_list"]
-        if not all(k in pack for k in required) or not isinstance(pack.get("mod_list"), list):
-            self.pack_data = None
-            self.btn_view_list.config(state="disabled")
-            self.lbl_name.config(text="-")
-            self.lbl_author.config(text="-")
-            self.lbl_version.config(text="-")
-            messagebox.showerror("错误", "模组包缺少必要字段或格式不正确！")
-            return
-
-        # 去掉空白和重复的 modid
-        mod_list = [m.strip() for m in pack["mod_list"] if isinstance(m, str) and m.strip()]
-        pack["mod_list"] = list(dict.fromkeys(mod_list))
-
-        self.pack_data = pack
-        self.lbl_name.config(text=str(pack["name"]))
-        self.lbl_author.config(text=str(pack["author"]))
-        self.lbl_version.config(text=str(pack["version"]))
-        self.btn_view_list.config(state="normal")
-
-    def view_mod_list(self):
-        """显示模组列表"""
-        if not self.pack_data:
-            return
-        top = tk.Toplevel(self)
-        top.title("模组列表")
-        top.geometry("420x360")
-        frm = ttk.Frame(top)
-        frm.pack(fill="both", expand=True, padx=10, pady=10)
-        sb = ttk.Scrollbar(frm, orient="vertical")
-        lb = tk.Listbox(frm, yscrollcommand=sb.set)
-        sb.config(command=lb.yview)
-        lb.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        for modid in self.pack_data.get("mod_list", []):
-            lb.insert(tk.END, modid)
-
-    def choose_save_dir(self):
-        path = filedialog.askdirectory(title="选择存储路径")
-        if path:
-            self.entry_save_dir.delete(0, tk.END)
-            self.entry_save_dir.insert(0, path)
-
-    # ---------- 合并按钮：开始 / 暂停 / 继续 ----------
-    def start_or_pause(self):
-        text = self.start_btn.cget("text")
-        if text == "开始下载":
-            self.start_download_thread()
-        elif text == "暂停下载":
-            # 进入暂停
-            self.pause_event.clear()
-            self.start_btn.config(text="继续下载")
-            self._safe_status("已暂停")
-        elif text == "继续下载":
-            # 继续
-            self.pause_event.set()
-            self.start_btn.config(text="暂停下载")
-            self._safe_status("继续下载…")
-
-    def cancel_download(self):
-        """取消下载：如果正在暂停，先强制恢复，再设置取消标记"""
-        # 关键点：强制恢复，避免线程卡在 wait() 中
         self.pause_event.set()
+
+    def cancel(self):
         self.cancel_flag = True
-        self._safe_status("取消中…")
-
-    # ---------- 线程与安全更新 ----------
-    def start_download_thread(self):
-        """启动后台下载线程，同时更新按钮状态"""
-        self.start_btn.config(text="暂停下载")
-        self.cancel_btn.config(state="normal")
-        self.cancel_flag = False
         self.pause_event.set()
-        t = threading.Thread(target=self._download_main, daemon=True)
-        t.start()
 
-    def _safe_status(self, text: str):
-        """安全更新状态栏"""
-        self.after(0, lambda: self.status.set(text))
+    def toggle_pause(self):
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            return True  # paused
+        else:
+            self.pause_event.set()
+            return False  # resumed
 
-    def _safe_progress(self, value: float):
-        """安全更新进度条"""
-        self.after(0, lambda: self.progress_var.set(value))
-
-    def _download_main(self):
-        """下载主逻辑入口，确保收尾恢复按钮"""
+    def run(self):
         try:
             self._do_download()
-        finally:
-            # 收尾：无论正常结束或被取消都恢复按钮
-            self.after(0, lambda: (
-                self.start_btn.config(text="开始下载"),
-                self.cancel_btn.config(state="disabled")
-            ))
+        except Exception as e:
+            self.status_updated.emit(f"错误: {str(e)}")
+            self.download_finished.emit(False, [], "", "")
 
-    # ---------- 下载逻辑 ----------
     def _do_download(self):
-        """执行实际的下载过程"""
-        modpack_path = self.entry_modpack.get().strip()
-        game_version = self.entry_game_version.get().strip()
-        loader = self.loader_var.get().strip().lower()
-        save_dir = self.entry_save_dir.get().strip()
-        pack_zip = self.zip_var.get()
+        modpack_path = self.modpack_path
+        game_version = self.game_version
+        loader = self.loader
+        save_dir = self.save_dir
+        pack_zip = self.zip_enabled
 
         # 基本校验
         if not os.path.isfile(modpack_path):
-            messagebox.showerror("错误", "请正确选择 .modpack 文件")
+            self.status_updated.emit("错误: 请正确选择 .modpack 文件")
+            self.download_finished.emit(False, [], "", "")
             return
+
         if not game_version:
-            messagebox.showerror("错误", "请输入游戏版本")
+            self.status_updated.emit("错误: 请输入游戏版本")
+            self.download_finished.emit(False, [], "", "")
             return
+
         if loader not in {"fabric", "forge", "quilt", "neoforge"}:
-            messagebox.showerror("错误", "请选择有效的加载器")
+            self.status_updated.emit("错误: 请选择有效的加载器")
+            self.download_finished.emit(False, [], "", "")
             return
+
         if not os.path.isdir(save_dir):
-            messagebox.showerror("错误", "请选择有效的模组存储路径")
+            self.status_updated.emit("错误: 请选择有效的模组存储路径")
+            self.download_finished.emit(False, [], "", "")
             return
 
         try:
             with open(modpack_path, "r", encoding="utf-8") as f:
                 pack = json.load(f)
         except Exception:
-            messagebox.showerror("错误", "模组包格式错误！")
+            self.status_updated.emit("错误: 模组包格式错误！")
+            self.download_finished.emit(False, [], "", "")
             return
 
         required = ["name", "author", "version", "mod_list"]
-        if not all(k in pack for k in required) or not isinstance(pack.get("mod_list"), list):
-            messagebox.showerror("错误", "模组包缺少必要字段或格式不正确！")
+        if not all(k in pack for k in required) or not isinstance(
+            pack.get("mod_list"), list
+        ):
+            self.status_updated.emit("错误: 模组包缺少必要字段或格式不正确！")
+            self.download_finished.emit(False, [], "", "")
             return
 
-        mod_list = [m.strip() for m in pack["mod_list"] if isinstance(m, str) and m.strip()]
-        if not mod_list:
-            messagebox.showerror("错误", "模组包的 mod_list 为空！")
+        # 处理 mod_list，支持两种格式：
+        # 1. 字符串列表: ["mod1", "mod2"]
+        # 2. 嵌套列表: [["mod1", "mod2"], "mod3", ["mod4", "mod5"]]
+        raw_mod_list = pack["mod_list"]
+        mod_groups = []
+
+        for item in raw_mod_list:
+            if isinstance(item, list):
+                # 如果是列表，过滤掉空字符串并去重
+                group = [m.strip() for m in item if isinstance(m, str) and m.strip()]
+                if group:
+                    mod_groups.append(list(dict.fromkeys(group)))
+            elif isinstance(item, str) and item.strip():
+                # 如果是字符串，作为单个元素的组
+                mod_groups.append([item.strip()])
+
+        if not mod_groups:
+            self.status_updated.emit("错误: 模组包的 mod_list 为空！")
+            self.download_finished.emit(False, [], "", "")
             return
 
-        self.total_mods = len(mod_list)
-        self.progress = 0.0
-        self._safe_progress(0.0)
-        self._safe_status("开始下载…")
+        total_mods = len(mod_groups)  # 注意：这里是组的数量，不是模组数量
+        progress = 0.0
+        self.progress_updated.emit(0.0)
+        self.status_updated.emit("开始下载…")
 
-        # 临时目录
         jartemp = tempfile.mkdtemp(prefix="packnload_")
         fails = []
 
         try:
-            for idx, modid in enumerate(mod_list, start=1):
-                # 若收到取消请求：不再开始下一个文件；删除临时目录并退出
+            for idx, mod_group in enumerate(mod_groups, start=1):
                 if self.cancel_flag:
-                    self._safe_status("已取消")
-                    return  # finally 会清理临时目录
+                    self.status_updated.emit("已取消")
+                    self.download_finished.emit(False, [], "", "")
+                    return
 
-                self._safe_status(f"[{idx}/{self.total_mods}] 解析 {modid} …")
+                # 显示当前组信息
+                group_display = ", ".join(mod_group)
+                self.status_updated.emit(
+                    f"[{idx}/{total_mods}] 解析组: {group_display} …"
+                )
 
-                versions = get_project_versions_filtered(modid, game_version, loader)
-                if not versions:
-                    fails.append(modid)
-                    self._bump_progress_to(idx)
-                    continue
+                # 尝试组内的每个模组，直到有一个成功
+                success_mod = None
+                failed_mods = []
 
-                file_obj = None
-                for v in versions:
-                    file_obj = pick_primary_file(v.get("files", []))
-                    if file_obj:
+                for modid in mod_group:
+                    if self.cancel_flag:
+                        self.status_updated.emit("已取消")
+                        self.download_finished.emit(False, [], "", "")
+                        return
+
+                    self.status_updated.emit(f"[{idx}/{total_mods}] 尝试 {modid} …")
+
+                    versions = get_project_versions_filtered(
+                        modid, game_version, loader
+                    )
+                    if not versions:
+                        failed_mods.append(modid)
+                        continue
+
+                    file_obj = None
+                    for v in versions:
+                        file_obj = pick_primary_file(v.get("files", []))
+                        if file_obj:
+                            break
+                    if not file_obj or "url" not in file_obj:
+                        failed_mods.append(modid)
+                        continue
+
+                    url = file_obj["url"]
+                    filename = file_obj.get("filename") or url.split("/")[-1]
+                    size_hint = int(file_obj.get("size") or 0)
+                    dst_path = os.path.join(jartemp, filename)
+
+                    self.status_updated.emit(f"[{idx}/{total_mods}] 下载 {modid} …")
+
+                    base = (idx - 1) * (100.0 / total_mods)
+                    weight = 100.0 / total_mods
+                    downloaded = 0
+
+                    def on_bytes(inc, total_or_none):
+                        nonlocal downloaded, progress
+                        downloaded += inc
+                        total_bytes = size_hint or (total_or_none or 0)
+                        if total_bytes > 0:
+                            frac = min(downloaded / total_bytes, 1.0)
+                            progress = base + frac * weight
+                        else:
+                            step = weight * (inc / 1_000_000)
+                            progress = min(base + step, base + weight)
+                        self.progress_updated.emit(progress)
+
+                    try:
+                        stream_download(
+                            url,
+                            dst_path,
+                            on_bytes=on_bytes,
+                            pause_event=self.pause_event,
+                        )
+                        # 下载成功
+                        success_mod = modid
                         break
-                if not file_obj or "url" not in file_obj:
-                    fails.append(modid)
-                    self._bump_progress_to(idx)
-                    continue
+                    except Exception:
+                        failed_mods.append(modid)
+                        continue
 
-                url = file_obj["url"]
-                filename = file_obj.get("filename") or url.split("/")[-1]
-                size_hint = int(file_obj.get("size") or 0)
-                dst_path = os.path.join(jartemp, filename)
+                # 处理组的结果
+                if success_mod is not None:
+                    # 组内有成功的，忽略其他失败的
+                    self._bump_progress(progress, idx, total_mods)
+                else:
+                    # 组内所有模组都失败了
+                    fails.append(mod_group)  # 将整个组加入失败列表
+                    self._bump_progress(progress, idx, total_mods)
 
-                self._safe_status(f"[{idx}/{self.total_mods}] 下载 {modid} …")
-
-                base = (idx - 1) * (100.0 / self.total_mods)
-                weight = 100.0 / self.total_mods
-                downloaded = 0
-
-                def on_bytes(inc, total_or_none):
-                    nonlocal downloaded
-                    downloaded += inc
-                    total_bytes = size_hint or (total_or_none or 0)
-                    if total_bytes > 0:
-                        frac = min(downloaded / total_bytes, 1.0)
-                        self.progress = base + frac * weight
-                    else:
-                        step = weight * (inc / 1_000_000)
-                        self.progress = min(base + step, base + weight)
-                    self._safe_progress(self.progress)
-
-                try:
-                    # 传入 pause_event：支持暂停；取消不会中断当前文件
-                    stream_download(url, dst_path, on_bytes=on_bytes, pause_event=self.pause_event)
-                except Exception:
-                    fails.append(modid)
-                    self._bump_progress_to(idx)
-                    continue
-
-                # 当前文件完成，推进到该文件应有的进度
-                self._bump_progress_to(idx)
-
-                # 若取消是在下载该文件过程中发起，此处文件已完整，立刻退出
                 if self.cancel_flag:
-                    self._safe_status("已取消")
-                    return  # finally 会清理临时目录
+                    self.status_updated.emit("已取消")
+                    self.download_finished.emit(False, [], "", "")
+                    return
 
-            # 打包或复制
-            self._safe_status("整理文件…")
+            self.status_updated.emit("整理文件…")
             if pack_zip:
-                zip_path = os.path.join(save_dir, f"{pack['name']}-{pack['version']}.zip")
-                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                zip_path = os.path.join(
+                    save_dir, f"{pack['name']}-{pack['version']}.zip"
+                )
+                with zipfile.ZipFile(
+                    zip_path, "w", compression=zipfile.ZIP_DEFLATED
+                ) as z:
                     for file in os.listdir(jartemp):
                         z.write(os.path.join(jartemp, file), arcname=file)
             else:
@@ -420,39 +317,366 @@ class App(tk.Tk):
                     shutil.copy2(os.path.join(jartemp, file), save_dir)
 
         finally:
-            # 始终清理临时目录
             shutil.rmtree(jartemp, ignore_errors=True)
 
-        self._safe_progress(100.0)
-        self._safe_status("完成")
+        self.progress_updated.emit(100.0)
+        self.status_updated.emit("完成")
 
         if fails:
-            top = tk.Toplevel(self)
-            top.title("下载失败模组列表")
-            top.geometry("400x300")
-            ttk.Label(top, text=f"成功下载!\n其中 {len(fails)} 个模组下载失败:", anchor="w").pack(fill="x", padx=10, pady=(10, 0))
-
-            frm = ttk.Frame(top)
-            frm.pack(fill="both", expand=True, padx=10, pady=10)
-
-            sb = ttk.Scrollbar(frm, orient="vertical")
-            lb = tk.Listbox(frm, yscrollcommand=sb.set)
-            sb.config(command=lb.yview)
-            lb.pack(side="left", fill="both", expand=True)
-            sb.pack(side="right", fill="y")
-
-            for modid in fails:
-                lb.insert(tk.END, modid)
+            self.download_finished.emit(
+                True, fails, pack.get("name", ""), pack.get("version", "")
+            )
         else:
-            messagebox.showinfo("完成", "成功下载!\n没有任何模组下载失败!")
+            self.download_finished.emit(
+                True, [], pack.get("name", ""), pack.get("version", "")
+            )
 
-    def _bump_progress_to(self, i_done: int):
-        """把进度推进到第 i_done 个模组完成应有的位置"""
-        target = min(i_done * (100.0 / max(self.total_mods, 1)), 100.0)
-        if target > self.progress:
-            self.progress = target
-            self._safe_progress(self.progress)
+    def _bump_progress(self, progress, i_done, total_mods):
+        target = min(i_done * (100.0 / max(total_mods, 1)), 100.0)
+        if target > progress:
+            progress = target
+            self.progress_updated.emit(progress)
+        return progress
+
+
+# ---------- Main Window ----------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.setMinimumSize(820, 480)
+
+        try:
+            self.setWindowIcon(QIcon(ICON_IMG))
+        except Exception:
+            pass
+
+        self.worker = None
+        self.pack_data = None
+
+        self._setup_ui()
+        self._connect_signals()
+
+    def _setup_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+
+        # 标题
+        title_label = QLabel(APP_TITLE)
+        title_font = QFont("Segoe UI", 20, QFont.Weight.Bold)
+        title_label.setFont(title_font)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addWidget(title_label)
+
+        # .modpack 路径选择
+        modpack_layout = QHBoxLayout()
+        modpack_layout.addWidget(QLabel(".modpack 文件路径:"))
+        self.modpack_entry = QLineEdit()
+        self.modpack_entry.setEnabled(False)
+        modpack_layout.addWidget(self.modpack_entry, 1)
+        self.modpack_btn = QPushButton("选择文件")
+        modpack_layout.addWidget(self.modpack_btn)
+        main_layout.addLayout(modpack_layout)
+
+        # 信息展示
+        info_frame = QFrame()
+        info_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        info_layout = QHBoxLayout(info_frame)
+
+        self.name_label = QLabel("名称: -")
+        info_layout.addWidget(self.name_label)
+        info_layout.addStretch()
+
+        self.author_label = QLabel("作者: -")
+        info_layout.addWidget(self.author_label)
+        info_layout.addStretch()
+
+        self.version_label = QLabel("版本: -")
+        info_layout.addWidget(self.version_label)
+        info_layout.addStretch()
+
+        self.view_list_btn = QPushButton("查看模组列表")
+        self.view_list_btn.setEnabled(False)
+        info_layout.addWidget(self.view_list_btn)
+
+        main_layout.addWidget(info_frame)
+
+        # 游戏版本
+        game_version_layout = QHBoxLayout()
+        game_version_layout.addWidget(QLabel("游戏版本:"))
+        self.game_version_entry = QLineEdit()
+        self.game_version_entry.setPlaceholderText("例如: 1.21.1")
+        game_version_layout.addWidget(self.game_version_entry)
+        main_layout.addLayout(game_version_layout)
+
+        # 加载器选择
+        loader_layout = QHBoxLayout()
+        loader_layout.addWidget(QLabel("加载器:"))
+        self.loader_combo = QComboBox()
+        self.loader_combo.addItems(["fabric", "forge", "quilt", "neoforge"])
+        loader_layout.addWidget(self.loader_combo)
+        loader_layout.addStretch()
+        main_layout.addLayout(loader_layout)
+
+        # 模组存储路径
+        save_dir_layout = QHBoxLayout()
+        save_dir_layout.addWidget(QLabel("模组存储路径:"))
+        self.save_dir_entry = QLineEdit()
+        self.save_dir_entry.setEnabled(False)
+        save_dir_layout.addWidget(self.save_dir_entry, 1)
+        self.save_dir_btn = QPushButton("选择文件夹")
+        save_dir_layout.addWidget(self.save_dir_btn)
+        main_layout.addLayout(save_dir_layout)
+
+        # ZIP 选项
+        self.zip_checkbox = QCheckBox("是否打包 ZIP")
+        main_layout.addWidget(self.zip_checkbox)
+
+        # 控制按钮
+        control_layout = QHBoxLayout()
+        control_layout.addStretch()
+        self.start_btn = QPushButton("开始下载")
+        self.start_btn.setMinimumWidth(120)
+        control_layout.addWidget(self.start_btn)
+
+        self.cancel_btn = QPushButton("取消下载")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setMinimumWidth(120)
+        control_layout.addWidget(self.cancel_btn)
+        control_layout.addStretch()
+        main_layout.addLayout(control_layout)
+
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        main_layout.addWidget(self.progress_bar)
+
+        # 状态栏
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setStyleSheet("color: #666;")
+        main_layout.addWidget(self.status_label)
+
+    def _connect_signals(self):
+        self.modpack_btn.clicked.connect(self.choose_modpack)
+        self.save_dir_btn.clicked.connect(self.choose_save_dir)
+        self.view_list_btn.clicked.connect(self.view_mod_list)
+        self.start_btn.clicked.connect(self.start_or_pause)
+        self.cancel_btn.clicked.connect(self.cancel_download)
+
+    def choose_modpack(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 .modpack 文件",
+            "",
+            "Modpack files (*.modpack);;All files (*.*)",
+            options=QFileDialog.DontUseNativeDialog,
+        )
+        if path:
+            self.modpack_entry.setText(path)
+            self.load_modpack_meta(path)
+
+    def load_modpack_meta(self, path: str):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                pack = json.load(f)
+        except Exception:
+            self.pack_data = None
+            self.view_list_btn.setEnabled(False)
+            self.name_label.setText("名称: -")
+            self.author_label.setText("作者: -")
+            self.version_label.setText("版本: -")
+            QMessageBox.critical(self, "错误", "模组包格式错误！")
+            return
+
+        required = ["name", "author", "version", "mod_list"]
+        if not all(k in pack for k in required) or not isinstance(
+            pack.get("mod_list"), list
+        ):
+            self.pack_data = None
+            self.view_list_btn.setEnabled(False)
+            self.name_label.setText("名称: -")
+            self.author_label.setText("作者: -")
+            self.version_label.setText("版本: -")
+            QMessageBox.critical(self, "错误", "模组包缺少必要字段或格式不正确！")
+            return
+
+        # 清理 mod_list，保留嵌套结构
+        cleaned_mod_list = []
+        for item in pack["mod_list"]:
+            if isinstance(item, list):
+                # 清理列表中的空字符串和空白
+                cleaned_item = [
+                    m.strip() for m in item if isinstance(m, str) and m.strip()
+                ]
+                if cleaned_item:
+                    # 去重
+                    cleaned_mod_list.append(list(dict.fromkeys(cleaned_item)))
+            elif isinstance(item, str) and item.strip():
+                cleaned_mod_list.append(item.strip())
+
+        pack["mod_list"] = cleaned_mod_list
+
+        self.pack_data = pack
+        self.name_label.setText(f"名称: {pack['name']}")
+        self.author_label.setText(f"作者: {pack['author']}")
+        self.version_label.setText(f"版本: {pack['version']}")
+        self.view_list_btn.setEnabled(True)
+
+    def view_mod_list(self):
+        if not self.pack_data:
+            return
+
+        dialog = QMainWindow(self)
+        dialog.setWindowTitle("模组列表")
+        dialog.setMinimumSize(420, 360)
+
+        central = QWidget()
+        dialog.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        list_widget = QListWidget()
+        for modid in self.pack_data.get("mod_list", []):
+            if isinstance(modid, list):
+                # 如果是列表，显示为 mod1/mod2 格式
+                display_text = "/".join(modid)
+            else:
+                # 如果是字符串，直接显示
+                display_text = str(modid)
+            list_widget.addItem(display_text)
+        layout.addWidget(list_widget)
+
+        dialog.show()
+
+    def choose_save_dir(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "选择存储路径", options=QFileDialog.DontUseNativeDialog
+        )
+        if path:
+            self.save_dir_entry.setText(path)
+
+    def start_or_pause(self):
+        text = self.start_btn.text()
+        if text == "开始下载":
+            self.start_download()
+        elif text == "暂停下载":
+            if self.worker:
+                is_paused = self.worker.toggle_pause()
+                self.start_btn.setText("继续下载" if is_paused else "暂停下载")
+                self.status_label.setText("已暂停" if is_paused else "继续下载…")
+        elif text == "继续下载":
+            if self.worker:
+                is_paused = self.worker.toggle_pause()
+                self.start_btn.setText("暂停下载")
+                self.status_label.setText("继续下载…")
+
+    def cancel_download(self):
+        if self.worker and self.worker.isRunning():
+            self.cancel_btn.setEnabled(False)
+            self.start_btn.setEnabled(False)
+            self.worker.cancel()
+            self.status_label.setText("取消中…")
+
+    def start_download(self):
+        modpack_path = self.modpack_entry.text().strip()
+        game_version = self.game_version_entry.text().strip()
+        loader = self.loader_combo.currentText()
+        save_dir = self.save_dir_entry.text().strip()
+        zip_enabled = self.zip_checkbox.isChecked()
+
+        # 基本校验
+        if not os.path.isfile(modpack_path):
+            QMessageBox.critical(self, "错误", "请正确选择 .modpack 文件")
+            return
+        if not game_version:
+            QMessageBox.critical(self, "错误", "请输入游戏版本")
+            return
+        if not os.path.isdir(save_dir):
+            QMessageBox.critical(self, "错误", "请选择有效的模组存储路径")
+            return
+
+        self.worker = DownloadWorker(
+            modpack_path, game_version, loader, save_dir, zip_enabled
+        )
+        self.worker.progress_updated.connect(self.update_progress)
+        self.worker.status_updated.connect(self.update_status)
+        self.worker.download_finished.connect(self.on_download_finished)
+
+        self.start_btn.setText("暂停下载")
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("开始下载…")
+
+        self.worker.start()
+
+    def update_progress(self, value):
+        self.progress_bar.setValue(int(value))
+
+    def update_status(self, text):
+        self.status_label.setText(text)
+
+    def on_download_finished(self, success, fails, pack_name, pack_version):
+        self.start_btn.setText("开始下载")
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+
+        if not success:
+            return
+
+        if fails:
+            dialog = QMainWindow(self)
+            dialog.setWindowTitle("下载失败模组列表")
+            dialog.setMinimumSize(400, 300)
+
+            central = QWidget()
+            dialog.setCentralWidget(central)
+            layout = QVBoxLayout(central)
+
+            info_label = QLabel(f"成功下载!\n其中 {len(fails)} 个模组下载失败:")
+            layout.addWidget(info_label)
+
+            list_widget = QListWidget()
+            for fail_group in fails:
+                if isinstance(fail_group, list):
+                    # 显示为 mod1/mod2 格式
+                    display_text = "/".join(fail_group)
+                else:
+                    display_text = str(fail_group)
+                list_widget.addItem(display_text)
+            layout.addWidget(list_widget)
+
+            dialog.show()
+        else:
+            QMessageBox.information(self, "完成", "成功下载!\n没有任何模组下载失败!")
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "确认退出",
+                "下载正在进行中，确定要退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.worker.cancel()
+                self.worker.wait()
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    main()
