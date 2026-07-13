@@ -2,7 +2,7 @@ import json
 import os
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QFont, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -27,6 +29,7 @@ class PacknloadEditor(QMainWindow):
         super().__init__()
         self.setWindowIcon(QIcon("./icon.ico"))
         self.current_file = None
+        self.is_modified = False
         self.init_ui()
         self.setup_theme()
 
@@ -97,6 +100,7 @@ class PacknloadEditor(QMainWindow):
         self.pack_name_input.setObjectName("packNameInput")
         self.pack_name_input.setPlaceholderText("输入模组包名称")
         self.pack_name_input.setMinimumHeight(45)
+        self.pack_name_input.textChanged.connect(self.mark_modified)
         pack_name_layout.addWidget(self.pack_name_input)
         container_layout.addWidget(pack_name_group)
 
@@ -108,6 +112,7 @@ class PacknloadEditor(QMainWindow):
         self.author_input.setObjectName("authorInput")
         self.author_input.setPlaceholderText("输入作者名称")
         self.author_input.setMinimumHeight(45)
+        self.author_input.textChanged.connect(self.mark_modified)
         author_layout.addWidget(self.author_input)
         container_layout.addWidget(author_group)
 
@@ -119,20 +124,26 @@ class PacknloadEditor(QMainWindow):
         self.version_input.setObjectName("versionInput")
         self.version_input.setPlaceholderText("输入版本号")
         self.version_input.setMinimumHeight(45)
+        self.version_input.textChanged.connect(self.mark_modified)
         version_layout.addWidget(self.version_input)
         container_layout.addWidget(version_group)
 
-        # 模组列表
+        # 模组列表 - 使用 QListWidget
         mods_group = QGroupBox("模组")
         mods_group.setObjectName("modsGroup")
         mods_layout = QVBoxLayout(mods_group)
-        self.mods_text = QTextEdit()
-        self.mods_text.setObjectName("modsText")
-        self.mods_text.setPlaceholderText(
-            "每行输入一个 Modrinth Slug\n例如:\nmod1\nmod2\nmod3"
-        )
-        self.mods_text.setMinimumHeight(250)
-        mods_layout.addWidget(self.mods_text)
+
+        # 创建 QListWidget 并设置属性
+        self.mods_list = QListWidget()
+        self.mods_list.setObjectName("modsList")
+        self.mods_list.setMinimumHeight(200)
+        self.mods_list.setMaximumHeight(200)
+        self.mods_list.setIconSize(QSize(16, 16))
+
+        # 添加初始的加号按钮
+        self.add_add_button()
+
+        mods_layout.addWidget(self.mods_list)
         container_layout.addWidget(mods_group)
 
         # 按钮容器
@@ -169,9 +180,143 @@ class PacknloadEditor(QMainWindow):
         # 监听系统主题变化
         QApplication.instance().paletteChanged.connect(self.on_palette_changed)
 
+    def mark_modified(self):
+        """标记文件已被修改"""
+        self.is_modified = True
+        if self.current_file:
+            self.setWindowTitle(
+                f"Packnload Editor - {os.path.basename(self.current_file)}*"
+            )
+        else:
+            self.setWindowTitle("Packnload Editor*")
+
+    def clear_modified(self):
+        """清除修改标记"""
+        self.is_modified = False
+        if self.current_file:
+            self.setWindowTitle(
+                f"Packnload Editor - {os.path.basename(self.current_file)}"
+            )
+        else:
+            self.setWindowTitle("Packnload Editor")
+
+    def add_add_button(self):
+        """添加加号按钮到列表末尾（使用自定义widget）"""
+        # 先移除旧的加号按钮
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            if item and item.data(Qt.UserRole) == "add_button":
+                self.mods_list.takeItem(i)
+                break
+
+        # 创建加号按钮的widget
+        add_widget = QWidget()
+        add_layout = QHBoxLayout(add_widget)
+        add_layout.setContentsMargins(0, 0, 0, 0)
+        add_layout.setAlignment(Qt.AlignCenter)
+
+        add_btn = QPushButton("+ 添加模组")
+        add_btn.setObjectName("addModButton")
+        add_btn.setCursor(Qt.PointingHandCursor)
+        add_btn.setMinimumHeight(64)
+        add_btn.clicked.connect(self.on_add_button_clicked)
+
+        add_layout.addWidget(add_btn)
+
+        # 创建列表项
+        add_item = QListWidgetItem()
+        add_item.setData(Qt.UserRole, "add_button")
+        add_item.setSizeHint(add_widget.sizeHint())
+
+        self.mods_list.addItem(add_item)
+        self.mods_list.setItemWidget(add_item, add_widget)
+
+    def create_mod_item(self, text=""):
+        """创建一个模组条目（包含减号按钮和输入框）"""
+        item_widget = QWidget()
+        item_layout = QHBoxLayout(item_widget)
+        item_layout.setContentsMargins(5, 5, 5, 5)
+        item_layout.setSpacing(8)
+
+        # 减号按钮
+        delete_btn = QPushButton("−")
+        delete_btn.setFixedSize(40, 40)
+        delete_btn.setObjectName("deleteButton")
+        delete_btn.setCursor(Qt.PointingHandCursor)
+        delete_btn.clicked.connect(lambda: self.delete_mod_item(item_widget))
+
+        # 输入框 - 加长
+        input_field = QLineEdit()
+        input_field.setText(text)
+        input_field.setObjectName("modInput")
+        input_field.setPlaceholderText("输入 Modrinth Slug")
+        input_field.textChanged.connect(self.mark_modified)
+        input_field.setMinimumWidth(200)
+        input_field.setFixedHeight(40)
+
+        item_layout.addWidget(delete_btn)
+        item_layout.addWidget(input_field)
+
+        return item_widget
+
+    def delete_mod_item(self, widget):
+        """删除指定的模组条目"""
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            if item and self.mods_list.itemWidget(item) == widget:
+                if item.data(Qt.UserRole) == "add_button":
+                    return
+                self.mods_list.takeItem(i)
+                self.mark_modified()
+                break
+
+    def ensure_add_button_last(self):
+        """确保加号按钮在列表最后"""
+        add_index = -1
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            if item and item.data(Qt.UserRole) == "add_button":
+                add_index = i
+                break
+
+        if add_index >= 0 and add_index < self.mods_list.count() - 1:
+            item = self.mods_list.takeItem(add_index)
+            self.mods_list.addItem(item)
+        elif add_index == -1:
+            self.add_add_button()
+
+    def on_add_button_clicked(self):
+        """点击加号按钮时添加新条目"""
+        # 找到加号按钮的位置
+        add_index = -1
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            if item and item.data(Qt.UserRole) == "add_button":
+                add_index = i
+                break
+
+        if add_index == -1:
+            return
+
+        # 创建新条目
+        new_item = QListWidgetItem()
+        new_item.setData(Qt.UserRole, "mod_item")
+        new_widget = self.create_mod_item("")
+        new_item.setSizeHint(QSize(new_widget.sizeHint().width(), 55))
+
+        # 插入到加号按钮前
+        self.mods_list.insertItem(add_index, new_item)
+        self.mods_list.setItemWidget(new_item, new_widget)
+
+        self.mark_modified()
+
+        # 聚焦到新添加的输入框
+        input_field = new_widget.findChild(QLineEdit)
+        if input_field:
+            input_field.setFocus()
+
     def setup_theme(self):
         """设置主题 - 让Qt自动管理"""
-        # 不强制设置调色板，让Qt使用系统主题
         self.setAttribute(Qt.WA_StyledBackground, True)
 
     def on_palette_changed(self, palette):
@@ -182,12 +327,10 @@ class PacknloadEditor(QMainWindow):
 
     def apply_stylesheet(self):
         """应用样式表 - 基于系统主题"""
-        # 获取当前系统调色板
         palette = self.palette()
         is_dark = palette.color(QPalette.Window).lightness() < 128
 
         if is_dark:
-            # 暗色主题样式
             stylesheet = f"""
                 QMainWindow {{
                     background-color: {palette.color(QPalette.Window).name()};
@@ -229,6 +372,36 @@ class PacknloadEditor(QMainWindow):
                     background-color: #1e8449;
                 }}
                 
+                QPushButton#deleteButton {{
+                    background-color: #c0392b;
+                    color: white;
+                    font-size: 18px;
+                    font-weight: bold;
+                    padding: 0px;
+                    min-height: 0px;
+                    border-radius: 6px;
+                }}
+                
+                QPushButton#deleteButton:hover {{
+                    background-color: #e74c3c;
+                }}
+                
+                QPushButton#addModButton {{
+                    background-color: #27ae60;
+                    color: white;
+                    font-size: 14px;
+                    font-weight: bold;
+                    padding: 6px 20px;
+                    border: 2px solid #2ecc71;
+                    border-radius: 8px;
+                    min-height: 28px;
+                }}
+                
+                QPushButton#addModButton:hover {{
+                    background-color: #2ecc71;
+                    border-color: #27ae60;
+                }}
+                
                 QLabel#fileInfo {{
                     background-color: {palette.color(QPalette.AlternateBase).name()};
                     color: {palette.color(QPalette.WindowText).name()};
@@ -258,11 +431,12 @@ class PacknloadEditor(QMainWindow):
                 QLineEdit, QTextEdit {{
                     background-color: {palette.color(QPalette.Base).name()};
                     color: {palette.color(QPalette.Text).name()};
-                    padding: 12px 15px;
+                    padding: 8px 15px;
                     border: 1px solid #444444;
                     border-radius: 8px;
                     font-size: 14px;
                     selection-background-color: #2980b9;
+                    line-height: 1.5;
                 }}
                 
                 QLineEdit:focus, QTextEdit:focus {{
@@ -271,6 +445,29 @@ class PacknloadEditor(QMainWindow):
                 
                 QTextEdit {{
                     font-family: monospace;
+                }}
+
+                QListWidget {{
+                    background-color: {palette.color(QPalette.Base).name()};
+                    color: {palette.color(QPalette.Text).name()};
+                    border: 1px solid #444444;
+                    border-radius: 8px;
+                    padding: 5px;
+                    outline: none;
+                }}
+                
+                QListWidget::item {{
+                    padding: 2px 0px;
+                    border: none;
+                }}
+                
+                QListWidget::item:selected {{
+                    background-color: transparent;
+                    color: {palette.color(QPalette.Text).name()};
+                }}
+                
+                QListWidget::item:hover {{
+                    background-color: transparent;
                 }}
                 
                 QScrollArea {{
@@ -293,9 +490,21 @@ class PacknloadEditor(QMainWindow):
                 QScrollBar::handle:vertical:hover {{
                     background-color: #555555;
                 }}
+
+                QMessageBox QPushButton {{
+                    background-color: #27ae60;
+                    color: white;
+                    border-radius: 8px;
+                    padding: 8px 20px;
+                    min-width: 80px;
+                    min-height: 30px;
+                }}
+                
+                QMessageBox QPushButton:hover {{
+                    background-color: #1e8449;
+                }}
             """
         else:
-            # 亮色主题样式 - 保持原始设计
             stylesheet = """
                 QMainWindow {
                     background-color: #f5f7fa;
@@ -339,6 +548,36 @@ class PacknloadEditor(QMainWindow):
                     background-color: #27ae60;
                 }
                 
+                QPushButton#deleteButton {
+                    background-color: #e74c3c;
+                    color: white;
+                    font-size: 18px;
+                    font-weight: bold;
+                    padding: 0px;
+                    min-height: 0px;
+                    border-radius: 6px;
+                }
+                
+                QPushButton#deleteButton:hover {
+                    background-color: #c0392b;
+                }
+                
+                QPushButton#addModButton {
+                    background-color: #27ae60;
+                    color: white;
+                    font-size: 14px;
+                    font-weight: bold;
+                    padding: 6px 20px;
+                    border: 2px solid #2ecc71;
+                    border-radius: 8px;
+                    min-height: 28px;
+                }
+                
+                QPushButton#addModButton:hover {
+                    background-color: #2ecc71;
+                    border-color: #27ae60;
+                }
+                
                 QLabel#fileInfo {
                     background-color: #f8f9fa;
                     color: #2c3e50;
@@ -367,7 +606,7 @@ class PacknloadEditor(QMainWindow):
                 }
                 
                 QLineEdit, QTextEdit {
-                    padding: 12px 18px;
+                    padding: 8px 15px;
                     border: 1px solid #dce4ec;
                     border-radius: 8px;
                     font-size: 14px;
@@ -380,6 +619,29 @@ class PacknloadEditor(QMainWindow):
                 
                 QTextEdit {
                     font-family: 'Consolas', 'Monaco', monospace;
+                }
+
+                QListWidget {
+                    background-color: white;
+                    color: #333333;
+                    border: 1px solid #dce4ec;
+                    border-radius: 8px;
+                    padding: 5px;
+                    outline: none;
+                }
+                
+                QListWidget::item {
+                    padding: 2px 0px;
+                    border: none;
+                }
+                
+                QListWidget::item:selected {
+                    background-color: transparent;
+                    color: #333333;
+                }
+                
+                QListWidget::item:hover {
+                    background-color: transparent;
                 }
                 
                 QScrollArea {
@@ -402,12 +664,36 @@ class PacknloadEditor(QMainWindow):
                 QScrollBar::handle:vertical:hover {
                     background-color: #a0a0a0;
                 }
+
+                QMessageBox QPushButton {
+                    background-color: #27ae60;
+                    color: white;
+                    border-radius: 8px;
+                    padding: 8px 20px;
+                    min-width: 80px;
+                    min-height: 30px;
+                }
+                
+                QMessageBox QPushButton:hover {
+                    background-color: #1e8449;
+                }
             """
 
         self.setStyleSheet(stylesheet)
 
     def open_file(self, fp=None):
         """打开文件"""
+        if self.is_modified:
+            reply = QMessageBox.question(
+                self,
+                "未保存的更改",
+                "当前文件有未保存的更改，是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                return
+
         if fp:
             file_path = fp
         else:
@@ -422,24 +708,20 @@ class PacknloadEditor(QMainWindow):
             return
 
         try:
-            # 检查文件扩展名
             file_ext = os.path.splitext(file_path)[1].lower()
             if file_ext not in [".json", ".modpack"]:
                 QMessageBox.critical(self, "错误", "此文件不是 JSON 或 .modpack 文件")
                 return
 
-            # 读取文件内容
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            # 检查文件是否为 JSON
             try:
                 json_data = json.loads(content)
             except json.JSONDecodeError:
                 QMessageBox.critical(self, "错误", "此文件不是有效的 JSON 格式")
                 return
 
-            # 检查必需字段
             required_fields = ["name", "author", "version", "mod_list"]
             missing_fields = [
                 field for field in required_fields if field not in json_data
@@ -453,36 +735,60 @@ class PacknloadEditor(QMainWindow):
                 )
                 return
 
-            # 读取并填充数据
             try:
-                # 模组包名
                 self.pack_name_input.setText(str(json_data.get("name", "")))
-
-                # 作者
                 self.author_input.setText(str(json_data.get("author", "")))
-
-                # 版本
                 self.version_input.setText(str(json_data.get("version", "")))
 
-                # 模组列表
-                if isinstance(json_data.get("mod_list"), list):
-                    self.mods_text.setPlainText("\n".join(json_data["mod_list"]))
-                else:
-                    self.mods_text.setPlainText("")
+                self.clear_mod_list()
+                self.add_add_button()
 
-                # 更新当前文件信息
+                mod_list = json_data.get("mod_list", [])
+                if isinstance(mod_list, list):
+                    for mod in mod_list:
+                        self.add_mod_item(str(mod))
+
                 self.current_file = file_path
                 self.file_info.setText(f"当前打开文件: {os.path.basename(file_path)}")
                 self.file_info.show()
-
-                # 显示"另存为"按钮
                 self.save_as_btn.show()
+                self.clear_modified()
 
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"读取文件内容时出错: {str(e)}")
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开文件时出错: {str(e)}")
+
+    def clear_mod_list(self):
+        """清空模组列表（保留加号按钮）"""
+        items_to_remove = []
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            if item and item.data(Qt.UserRole) != "add_button":
+                items_to_remove.append(i)
+
+        for i in reversed(items_to_remove):
+            self.mods_list.takeItem(i)
+
+    def add_mod_item(self, text=""):
+        """添加一个模组条目（在加号按钮前插入）"""
+        add_index = -1
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            if item and item.data(Qt.UserRole) == "add_button":
+                add_index = i
+                break
+
+        new_item = QListWidgetItem()
+        new_item.setData(Qt.UserRole, "mod_item")
+        new_widget = self.create_mod_item(text)
+
+        if add_index >= 0:
+            self.mods_list.insertItem(add_index, new_item)
+        else:
+            self.mods_list.addItem(new_item)
+        self.mods_list.setItemWidget(new_item, new_widget)
 
     def validate_form_data(self):
         """验证表单数据"""
@@ -502,8 +808,21 @@ class PacknloadEditor(QMainWindow):
 
     def collect_form_data(self):
         """收集表单数据"""
-        mods_text = self.mods_text.toPlainText().strip()
-        mod_list = [mod.strip() for mod in mods_text.split("\n") if mod.strip()]
+        mod_list = []
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            if item and item.data(Qt.UserRole) != "add_button":
+                widget = self.mods_list.itemWidget(item)
+                if widget:
+                    input_field = widget.findChild(QLineEdit)
+                    if input_field:
+                        text = input_field.text().strip()
+                        if text:
+                            text_split = text.split(",")
+                            if len(text_split) > 1:
+                                mod_list.append(text_split)
+                            else:
+                                mod_list.append(text)
 
         return {
             "name": self.pack_name_input.text().strip(),
@@ -520,15 +839,14 @@ class PacknloadEditor(QMainWindow):
         data = self.collect_form_data()
 
         if self.current_file:
-            # 覆盖保存当前文件
             try:
                 with open(self.current_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
+                self.clear_modified()
                 QMessageBox.information(self, "成功", "文件保存成功！")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存文件时出错: {str(e)}")
         else:
-            # 没有打开文件，走另存为逻辑
             self.save_as_file()
 
     def save_as_file(self):
@@ -538,7 +856,6 @@ class PacknloadEditor(QMainWindow):
 
         data = self.collect_form_data()
 
-        # 生成默认文件名
         default_name = f"{data['name']}_{data['version']}.modpack"
         default_name = "".join(
             c if c.isalnum() or c in "._- " else "_" for c in default_name
@@ -558,11 +875,11 @@ class PacknloadEditor(QMainWindow):
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
-            # 更新当前文件信息
             self.current_file = file_path
             self.file_info.setText(f"当前打开文件: {os.path.basename(file_path)}")
             self.file_info.show()
             self.save_as_btn.show()
+            self.clear_modified()
 
             QMessageBox.information(
                 self, "成功", f"文件已另存为: {os.path.basename(file_path)}"
@@ -570,12 +887,35 @@ class PacknloadEditor(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"另存为文件时出错: {str(e)}")
 
+    def closeEvent(self, event):
+        """关闭事件 - 检查是否有未保存的修改"""
+        if self.is_modified:
+            reply = QMessageBox.question(
+                self,
+                "未保存的更改",
+                "文件尚未保存，是否保存？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+
+            if reply == QMessageBox.Save:
+                self.save_file()
+                if self.is_modified:
+                    event.ignore()
+                    return
+                event.accept()
+            elif reply == QMessageBox.Discard:
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # 设置应用程序字体
     font = QFont("Segoe UI", 10)
     app.setFont(font)
 
