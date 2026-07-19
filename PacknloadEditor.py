@@ -1,910 +1,744 @@
 import json
 import os
+import shutil
 import sys
+import tempfile
+import threading
+import zipfile
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QFont, QIcon, QPalette
+import requests
+from PacknloadEditor import PacknloadEditor
+from PySide6.QtCore import (
+    Qt,
+    QThread,
+    Signal,
+)
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
-    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
-isAlone = False
+APP_TITLE = "Packnload"
+ICON_IMG = "icon.ico"
+BASE_URL = "https://api.modrinth.com/v2"
+UA = {"User-Agent": "Packnload/1.2 (+https://modrinth.com/)"}
 
 
-class PacknloadEditor(QMainWindow):
+# ---------- Modrinth API helpers ----------
+def get_project_versions_filtered(modid: str, game_version: str, loader: str):
+    """
+    用 Modrinth API v2 获取指定项目的版本。
+    GET /project/{id|slug}/version?loaders=["fabric"]&game_versions=["1.21.1"]
+    返回版本数组，可能为空。
+    """
+    url = f"{BASE_URL}/project/{modid}/version"
+    params = {
+        "loaders": json.dumps([loader]),
+        "game_versions": json.dumps([game_version]),
+    }
+    try:
+        r = requests.get(url, params=params, headers=UA, timeout=30)
+        if r.status_code != 200:
+            return []
+        return r.json() or []
+    except Exception:
+        return []
+
+
+def pick_primary_file(files: list):
+    """从文件列表里挑出一个下载文件，优先选择 primary=true 的"""
+    if not files:
+        return None
+    for f in files:
+        if f.get("primary"):
+            return f
+    return files[0]
+
+
+def stream_download(url: str, dst_path: str, on_bytes=None, pause_event=None):
+    """
+    把远程文件流式下载到本地。
+    on_bytes(inc_bytes, total_bytes or None) 用于进度回调。
+    pause_event 可选；若提供，则在每个 chunk 写入前 wait()，用于"暂停/继续"。
+    """
+    with requests.get(url, stream=True, headers=UA, timeout=(10, 120)) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length") or 0)
+        with open(dst_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                if pause_event is not None:
+                    pause_event.wait()
+                f.write(chunk)
+                if on_bytes:
+                    on_bytes(len(chunk), total if total > 0 else None)
+
+
+# ---------- Download Worker Thread ----------
+class DownloadWorker(QThread):
+    progress_updated = Signal(float)
+    status_updated = Signal(str)
+    download_finished = Signal(
+        bool, list, str, str
+    )  # success, fails, pack_name, pack_version
+    log_updated = Signal(str)
+
+    def __init__(self, modpack_path, game_version, loader, save_dir, zip_enabled):
+        super().__init__()
+        self.modpack_path = modpack_path
+        self.game_version = game_version
+        self.loader = loader
+        self.save_dir = save_dir
+        self.zip_enabled = zip_enabled
+
+        self.cancel_flag = False
+        self.pause_event = threading.Event()
+        self.pause_event.set()
+
+    def cancel(self):
+        self.cancel_flag = True
+        self.pause_event.set()
+
+    def toggle_pause(self):
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            return True  # paused
+        else:
+            self.pause_event.set()
+            return False  # resumed
+
+    def run(self):
+        try:
+            self._do_download()
+        except Exception as e:
+            self.status_updated.emit(f"错误: {str(e)}")
+            self.download_finished.emit(False, [], "", "")
+
+    def _do_download(self):
+        modpack_path = self.modpack_path
+        game_version = self.game_version
+        loader = self.loader
+        save_dir = self.save_dir
+        pack_zip = self.zip_enabled
+
+        # 基本校验
+        if not os.path.isfile(modpack_path):
+            self.status_updated.emit("错误: 请正确选择 .modpack 文件")
+            self.download_finished.emit(False, [], "", "")
+            return
+
+        if not game_version:
+            self.status_updated.emit("错误: 请输入游戏版本")
+            self.download_finished.emit(False, [], "", "")
+            return
+
+        if loader not in {"fabric", "forge", "quilt", "neoforge"}:
+            self.status_updated.emit("错误: 请选择有效的加载器")
+            self.download_finished.emit(False, [], "", "")
+            return
+
+        if not os.path.isdir(save_dir):
+            self.status_updated.emit("错误: 请选择有效的模组存储路径")
+            self.download_finished.emit(False, [], "", "")
+            return
+
+        try:
+            with open(modpack_path, "r", encoding="utf-8") as f:
+                pack = json.load(f)
+        except Exception:
+            self.status_updated.emit("错误: 模组包格式错误！")
+            self.download_finished.emit(False, [], "", "")
+            return
+
+        required = ["name", "author", "version", "mod_list"]
+        if not all(k in pack for k in required) or not isinstance(
+            pack.get("mod_list"), list
+        ):
+            self.status_updated.emit("错误: 模组包缺少必要字段或格式不正确！")
+            self.download_finished.emit(False, [], "", "")
+            return
+
+        # 处理 mod_list，支持两种格式：
+        # 1. 字符串列表: ["mod1", "mod2"]
+        # 2. 嵌套列表: [["mod1", "mod2"], "mod3", ["mod4", "mod5"]]
+        raw_mod_list = pack["mod_list"]
+        mod_groups = []
+
+        for item in raw_mod_list:
+            if isinstance(item, list):
+                # 如果是列表，过滤掉空字符串并去重
+                group = [m.strip() for m in item if isinstance(m, str) and m.strip()]
+                if group:
+                    mod_groups.append(list(dict.fromkeys(group)))
+            elif isinstance(item, str) and item.strip():
+                # 如果是字符串，作为单个元素的组
+                mod_groups.append([item.strip()])
+
+        if not mod_groups:
+            self.status_updated.emit("错误: 模组包的 mod_list 为空！")
+            self.download_finished.emit(False, [], "", "")
+            return
+
+        total_mods = len(mod_groups)  # 注意：这里是组的数量，不是模组数量
+        progress = 0.0
+        self.progress_updated.emit(0.0)
+        self.status_updated.emit("开始下载…")
+
+        jartemp = tempfile.mkdtemp(prefix="packnload_")
+        fails = []
+
+        try:
+            for idx, mod_group in enumerate(mod_groups, start=1):
+                if self.cancel_flag:
+                    self.status_updated.emit("已取消")
+                    self.download_finished.emit(False, [], "", "")
+                    return
+
+                # 显示当前组信息
+                group_display = ", ".join(mod_group)
+                self.status_updated.emit(
+                    f"[{idx}/{total_mods}] 解析组: {group_display} …"
+                )
+
+                # 尝试组内的每个模组，直到有一个成功
+                success_mod = None
+                failed_mods = []
+
+                for modid in mod_group:
+                    if self.cancel_flag:
+                        self.status_updated.emit("已取消")
+                        self.download_finished.emit(False, [], "", "")
+                        return
+
+                    self.status_updated.emit(f"[{idx}/{total_mods}] 尝试 {modid} …")
+
+                    versions = get_project_versions_filtered(
+                        modid, game_version, loader
+                    )
+                    if not versions:
+                        failed_mods.append(modid)
+                        continue
+
+                    file_obj = None
+                    for v in versions:
+                        file_obj = pick_primary_file(v.get("files", []))
+                        if file_obj:
+                            break
+                    if not file_obj or "url" not in file_obj:
+                        failed_mods.append(modid)
+                        continue
+
+                    url = file_obj["url"]
+                    filename = file_obj.get("filename") or url.split("/")[-1]
+                    size_hint = int(file_obj.get("size") or 0)
+                    dst_path = os.path.join(jartemp, filename)
+
+                    self.status_updated.emit(f"[{idx}/{total_mods}] 下载 {modid} …")
+
+                    base = (idx - 1) * (100.0 / total_mods)
+                    weight = 100.0 / total_mods
+                    downloaded = 0
+
+                    def on_bytes(inc, total_or_none):
+                        nonlocal downloaded, progress
+                        downloaded += inc
+                        total_bytes = size_hint or (total_or_none or 0)
+                        if total_bytes > 0:
+                            frac = min(downloaded / total_bytes, 1.0)
+                            progress = base + frac * weight
+                        else:
+                            step = weight * (inc / 1_000_000)
+                            progress = min(base + step, base + weight)
+                        self.progress_updated.emit(progress)
+
+                    try:
+                        stream_download(
+                            url,
+                            dst_path,
+                            on_bytes=on_bytes,
+                            pause_event=self.pause_event,
+                        )
+                        # 下载成功
+                        success_mod = modid
+                        break
+                    except Exception:
+                        failed_mods.append(modid)
+                        continue
+
+                # 处理组的结果
+                if success_mod is not None:
+                    # 组内有成功的，忽略其他失败的
+                    self._bump_progress(progress, idx, total_mods)
+                else:
+                    # 组内所有模组都失败了
+                    fails.append(mod_group)  # 将整个组加入失败列表
+                    self._bump_progress(progress, idx, total_mods)
+
+                if self.cancel_flag:
+                    self.status_updated.emit("已取消")
+                    self.download_finished.emit(False, [], "", "")
+                    return
+
+            self.status_updated.emit("整理文件…")
+            if pack_zip:
+                zip_path = os.path.join(
+                    save_dir, f"{pack['name']}-{pack['version']}.zip"
+                )
+                with zipfile.ZipFile(
+                    zip_path, "w", compression=zipfile.ZIP_DEFLATED
+                ) as z:
+                    for file in os.listdir(jartemp):
+                        z.write(os.path.join(jartemp, file), arcname=file)
+            else:
+                for file in os.listdir(jartemp):
+                    shutil.copy2(os.path.join(jartemp, file), save_dir)
+
+        finally:
+            shutil.rmtree(jartemp, ignore_errors=True)
+
+        self.progress_updated.emit(100.0)
+        self.status_updated.emit("完成")
+
+        if fails:
+            self.download_finished.emit(
+                True, fails, pack.get("name", ""), pack.get("version", "")
+            )
+        else:
+            self.download_finished.emit(
+                True, [], pack.get("name", ""), pack.get("version", "")
+            )
+
+    def _bump_progress(self, progress, i_done, total_mods):
+        target = min(i_done * (100.0 / max(total_mods, 1)), 100.0)
+        if target > progress:
+            progress = target
+            self.progress_updated.emit(progress)
+        return progress
+
+
+# ---------- Main Window ----------
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowIcon(QIcon("./icon.ico"))
-        self.current_file = None
-        self.is_modified = False
-        self.init_ui()
-        self.setup_theme()
+        self.setWindowTitle(APP_TITLE)
+        self.setMinimumSize(820, 480)
 
-    def init_ui(self):
-        self.setWindowTitle("Packnload Editor")
-        self.setMinimumSize(850, 750)
+        try:
+            self.setWindowIcon(QIcon(ICON_IMG))
+        except Exception:
+            pass
 
-        # 创建中央部件和滚动区域
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setFrameShape(QFrame.NoFrame)
+        self.editor_window = None
+        self.worker = None
+        self.pack_data = None
 
+        self._setup_ui()
+        self._connect_signals()
+
+    def _setup_ui(self):
         central_widget = QWidget()
-        scroll_area.setWidget(central_widget)
-        self.setCentralWidget(scroll_area)
-
+        self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(25)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(20, 20, 20, 20)
 
         # 标题
-        title_label = QLabel("Packnload Editor")
-        title_font = QFont()
-        title_font.setPointSize(28)
-        title_font.setBold(True)
+        title_label = QLabel(APP_TITLE)
+        title_font = QFont("Segoe UI", 20, QFont.Weight.Bold)
         title_label.setFont(title_font)
-        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(title_label)
 
-        # 主容器
-        container = QWidget()
-        container_layout = QVBoxLayout(container)
-        container_layout.setSpacing(25)
-        container_layout.setContentsMargins(35, 35, 35, 35)
-
-        # 打开文件按钮
-        self.open_file_btn = QPushButton("打开文件")
-        self.open_file_btn.setObjectName("openFileButton")
-        self.open_file_btn.clicked.connect(self.open_file)
-        self.open_file_btn.setMinimumHeight(50)
-        container_layout.addWidget(self.open_file_btn)
-
-        # 文件信息
-        self.file_info = QLabel("当前打开文件: 无")
-        self.file_info.setObjectName("fileInfo")
-        self.file_info.hide()
-        container_layout.addWidget(self.file_info)
-
-        # 模组包名
-        pack_name_group = QGroupBox("模组包名")
-        pack_name_group.setObjectName("packNameGroup")
-        pack_name_layout = QVBoxLayout(pack_name_group)
-        self.pack_name_input = QLineEdit()
-        self.pack_name_input.setObjectName("packNameInput")
-        self.pack_name_input.setPlaceholderText("输入模组包名称")
-        self.pack_name_input.setMinimumHeight(45)
-        self.pack_name_input.textChanged.connect(self.mark_modified)
-        pack_name_layout.addWidget(self.pack_name_input)
-        container_layout.addWidget(pack_name_group)
-
-        # 作者
-        author_group = QGroupBox("作者")
-        author_group.setObjectName("authorGroup")
-        author_layout = QVBoxLayout(author_group)
-        self.author_input = QLineEdit()
-        self.author_input.setObjectName("authorInput")
-        self.author_input.setPlaceholderText("输入作者名称")
-        self.author_input.setMinimumHeight(45)
-        self.author_input.textChanged.connect(self.mark_modified)
-        author_layout.addWidget(self.author_input)
-        container_layout.addWidget(author_group)
-
-        # 版本
-        version_group = QGroupBox("版本")
-        version_group.setObjectName("versionGroup")
-        version_layout = QVBoxLayout(version_group)
-        self.version_input = QLineEdit()
-        self.version_input.setObjectName("versionInput")
-        self.version_input.setPlaceholderText("输入版本号")
-        self.version_input.setMinimumHeight(45)
-        self.version_input.textChanged.connect(self.mark_modified)
-        version_layout.addWidget(self.version_input)
-        container_layout.addWidget(version_group)
-
-        # 模组列表
-        mods_group = QGroupBox("模组")
-        mods_group.setObjectName("modsGroup")
-        mods_layout = QVBoxLayout(mods_group)
-
-        # 创建 QListWidget 并设置属性
-        self.mods_list = QListWidget()
-        self.mods_list.setObjectName("modsList")
-        self.mods_list.setMinimumHeight(200)
-        self.mods_list.setMaximumHeight(200)
-        self.mods_list.setIconSize(QSize(16, 16))
-
-        # 添加初始的加号按钮
-        self.add_add_button()
-
-        mods_layout.addWidget(self.mods_list)
-        container_layout.addWidget(mods_group)
-
-        # 按钮容器
-        btn_container = QWidget()
-        btn_layout = QHBoxLayout(btn_container)
-        btn_layout.setSpacing(20)
-        btn_layout.setContentsMargins(0, 10, 0, 0)
-
-        # 保存按钮
-        self.save_btn = QPushButton("保存")
-        self.save_btn.setObjectName("saveButton")
-        self.save_btn.clicked.connect(self.save_file)
-        self.save_btn.setMinimumSize(120, 50)
-        btn_layout.addWidget(self.save_btn)
-
-        # 另存为按钮
-        self.save_as_btn = QPushButton("另存为")
-        self.save_as_btn.setObjectName("saveAsButton")
-        self.save_as_btn.clicked.connect(self.save_as_file)
-        self.save_as_btn.hide()
-        self.save_as_btn.setMinimumSize(120, 50)
-        btn_layout.addWidget(self.save_as_btn)
-
-        btn_layout.addStretch()
-        container_layout.addWidget(btn_container)
-
-        # 设置容器样式
-        container.setObjectName("container")
-        main_layout.addWidget(container)
-
-        # 应用样式
-        self.apply_stylesheet()
-
-        # 监听系统主题变化
-        QApplication.instance().paletteChanged.connect(self.on_palette_changed)
-
-    def mark_modified(self):
-        """标记文件已被修改"""
-        self.is_modified = True
-        if self.current_file:
-            self.setWindowTitle(
-                f"Packnload Editor - {os.path.basename(self.current_file)}*"
-            )
-        else:
-            self.setWindowTitle("Packnload Editor*")
-
-    def clear_modified(self):
-        """清除修改标记"""
-        self.is_modified = False
-        if self.current_file:
-            self.setWindowTitle(
-                f"Packnload Editor - {os.path.basename(self.current_file)}"
-            )
-        else:
-            self.setWindowTitle("Packnload Editor")
-
-    def add_add_button(self):
-        """添加加号按钮到列表末尾（使用自定义widget）"""
-        # 先移除旧的加号按钮
-        for i in range(self.mods_list.count()):
-            item = self.mods_list.item(i)
-            if item and item.data(Qt.UserRole) == "add_button":
-                self.mods_list.takeItem(i)
-                break
-
-        # 创建加号按钮的widget
-        add_widget = QWidget()
-        add_layout = QHBoxLayout(add_widget)
-        add_layout.setContentsMargins(0, 0, 0, 0)
-        add_layout.setAlignment(Qt.AlignCenter)
-
-        add_btn = QPushButton("+ 添加模组")
-        add_btn.setObjectName("addModButton")
-        add_btn.setCursor(Qt.PointingHandCursor)
-        add_btn.setMinimumHeight(64)
-        add_btn.clicked.connect(self.on_add_button_clicked)
-
-        add_layout.addWidget(add_btn)
-
-        # 创建列表项
-        add_item = QListWidgetItem()
-        add_item.setData(Qt.UserRole, "add_button")
-        add_item.setSizeHint(add_widget.sizeHint())
-
-        self.mods_list.addItem(add_item)
-        self.mods_list.setItemWidget(add_item, add_widget)
-
-    def create_mod_item(self, text=""):
-        """创建一个模组条目（包含减号按钮和输入框）"""
-        item_widget = QWidget()
-        item_layout = QHBoxLayout(item_widget)
-        item_layout.setContentsMargins(5, 5, 5, 5)
-        item_layout.setSpacing(8)
-
-        # 减号按钮
-        delete_btn = QPushButton("−")
-        delete_btn.setFixedSize(40, 40)
-        delete_btn.setObjectName("deleteButton")
-        delete_btn.setCursor(Qt.PointingHandCursor)
-        delete_btn.clicked.connect(lambda: self.delete_mod_item(item_widget))
-
-        # 输入框
-        input_field = QLineEdit()
-        input_field.setText(text)
-        input_field.setObjectName("modInput")
-        input_field.setPlaceholderText("输入 Modrinth Slug")
-        input_field.textChanged.connect(self.mark_modified)
-        input_field.setMinimumWidth(200)
-        input_field.setFixedHeight(40)
-
-        item_layout.addWidget(delete_btn)
-        item_layout.addWidget(input_field)
-
-        return item_widget
-
-    def delete_mod_item(self, widget):
-        """删除指定的模组条目"""
-        for i in range(self.mods_list.count()):
-            item = self.mods_list.item(i)
-            if item and self.mods_list.itemWidget(item) == widget:
-                if item.data(Qt.UserRole) == "add_button":
-                    return
-                self.mods_list.takeItem(i)
-                self.mark_modified()
-                break
-
-    def ensure_add_button_last(self):
-        """确保加号按钮在列表最后"""
-        add_index = -1
-        for i in range(self.mods_list.count()):
-            item = self.mods_list.item(i)
-            if item and item.data(Qt.UserRole) == "add_button":
-                add_index = i
-                break
-
-        if add_index >= 0 and add_index < self.mods_list.count() - 1:
-            item = self.mods_list.takeItem(add_index)
-            self.mods_list.addItem(item)
-        elif add_index == -1:
-            self.add_add_button()
-
-    def on_add_button_clicked(self):
-        """点击加号按钮时添加新条目"""
-        # 找到加号按钮的位置
-        add_index = -1
-        for i in range(self.mods_list.count()):
-            item = self.mods_list.item(i)
-            if item and item.data(Qt.UserRole) == "add_button":
-                add_index = i
-                break
-
-        if add_index == -1:
-            return
-
-        # 创建新条目
-        new_item = QListWidgetItem()
-        new_item.setData(Qt.UserRole, "mod_item")
-        new_widget = self.create_mod_item("")
-        new_item.setSizeHint(QSize(new_widget.sizeHint().width(), 55))
-
-        # 插入到加号按钮前
-        self.mods_list.insertItem(add_index, new_item)
-        self.mods_list.setItemWidget(new_item, new_widget)
-
-        self.mark_modified()
-
-        # 聚焦到新添加的输入框
-        input_field = new_widget.findChild(QLineEdit)
-        if input_field:
-            input_field.setFocus()
-
-    def setup_theme(self):
-        """设置主题 - 让Qt自动管理"""
-        self.setAttribute(Qt.WA_StyledBackground, True)
-
-    def on_palette_changed(self, palette):
-        """系统主题变化时的处理"""
-        self.apply_stylesheet()
-        if hasattr(self, "about_label"):
-            self.about_label.update_style()
-
-    def apply_stylesheet(self):
-        """应用样式表 - 基于系统主题"""
-        palette = self.palette()
-        is_dark = palette.color(QPalette.Window).lightness() < 128
-
-        if is_dark:
-            stylesheet = f"""
-                QWidget#container {{
-                    border-radius: 12px;
-                }}
-                
-                QPushButton {{
-                    border: none;
-                    border-radius: 8px;
-                    padding: 12px 24px;
-                    font-weight: bold;
-                    font-size: 14px;
-                    min-height: 40px;
-                }}
-                
-                QPushButton#openFileButton, QPushButton#saveButton {{
-                    background-color: #2980b9;
-                    color: white;
-                }}
-                
-                QPushButton#openFileButton:hover, QPushButton#saveButton:hover {{
-                    background-color: #1c6ea4;
-                }}
-                
-                QPushButton#saveAsButton {{
-                    background-color: #27ae60;
-                    color: white;
-                }}
-                
-                QPushButton#saveAsButton:hover {{
-                    background-color: #1e8449;
-                }}
-                
-                QPushButton#deleteButton {{
-                    background-color: #c0392b;
-                    color: white;
-                    font-size: 18px;
-                    font-weight: bold;
-                    padding: 0px;
-                    min-height: 0px;
-                    border-radius: 6px;
-                }}
-                
-                QPushButton#deleteButton:hover {{
-                    background-color: #e74c3c;
-                }}
-                
-                QPushButton#addModButton {{
-                    background-color: #27ae60;
-                    color: white;
-                    font-size: 14px;
-                    font-weight: bold;
-                    padding: 6px 20px;
-                    border: 2px solid #2ecc71;
-                    border-radius: 8px;
-                    min-height: 28px;
-                }}
-                
-                QPushButton#addModButton:hover {{
-                    background-color: #2ecc71;
-                    border-color: #27ae60;
-                }}
-                
-                QLabel#fileInfo {{
-                    background-color: rgba(255, 255, 255, 0.08);
-                    padding: 15px;
-                    border-radius: 8px;
-                    border-left: 4px solid #2980b9;
-                    font-size: 14px;
-                }}
-                
-                QGroupBox {{
-                    font-size: 16px;
-                    font-weight: bold;
-                    border: 1px dashed #555555;
-                    border-radius: 6px;
-                    margin-top: 10px;
-                    padding-top: 10px;
-                }}
-                
-                QGroupBox::title {{
-                    subcontrol-origin: margin;
-                    left: 10px;
-                    padding: 0 5px 0 5px;
-                }}
-
-                QLineEdit, QTextEdit {{
-                    padding: 8px 15px;
-                    border: 1px solid #444444;
-                    border-radius: 8px;
-                    font-size: 14px;
-                    selection-background-color: #2980b9;
-                    line-height: 1.5;
-                }}
-                
-                QLineEdit:focus, QTextEdit:focus {{
-                    border-color: #2980b9;
-                }}
-                
-                QTextEdit {{
-                    font-family: monospace;
-                }}
-
-                QListWidget {{
-                    border: 1px solid #444444;
-                    border-radius: 8px;
-                    padding: 5px;
-                    outline: none;
-                }}
-                
-                QListWidget::item {{
-                    padding: 2px 0px;
-                    border: none;
-                }}
-                
-                QListWidget::item:selected {{
-                    background-color: transparent;
-                }}
-                
-                QListWidget::item:hover {{
-                    background-color: transparent;
-                }}
-                
-                QScrollArea {{
-                    border: none;
-                    background-color: transparent;
-                }}
-                
-                QScrollBar:vertical {{
-                    background-color: #2d2d32;
-                    width: 12px;
-                    border-radius: 6px;
-                }}
-                
-                QScrollBar::handle:vertical {{
-                    background-color: #444444;
-                    border-radius: 6px;
-                    min-height: 20px;
-                }}
-                
-                QScrollBar::handle:vertical:hover {{
-                    background-color: #555555;
-                }}
-
-                QMessageBox QPushButton {{
-                    background-color: #27ae60;
-                    color: white;
-                    border-radius: 8px;
-                    padding: 8px 20px;
-                    min-width: 80px;
-                    min-height: 30px;
-                }}
-                
-                QMessageBox QPushButton:hover {{
-                    background-color: #1e8449;
-                }}
-            """
-        else:
-            stylesheet = """
-                QMainWindow {
-                    background-color: #f5f7fa;
-                }
-                
-                QLabel {
-                    color: #333333;
-                }
-                
-                QWidget#container {
-                    background-color: white;
-                    border-radius: 12px;
-                    box-shadow: 0 6px 15px rgba(0, 0, 0, 0.08);
-                }
-                
-                QPushButton {
-                    border: none;
-                    border-radius: 8px;
-                    padding: 12px 28px;
-                    font-weight: 600;
-                    font-size: 15px;
-                    min-height: 50px;
-                    min-width: 120px;
-                }
-                
-                QPushButton#openFileButton, QPushButton#saveButton {
-                    background-color: #3498db;
-                    color: white;
-                }
-                
-                QPushButton#openFileButton:hover, QPushButton#saveButton:hover {
-                    background-color: #2980b9;
-                }
-                
-                QPushButton#saveAsButton {
-                    background-color: #2ecc71;
-                    color: white;
-                }
-                
-                QPushButton#saveAsButton:hover {
-                    background-color: #27ae60;
-                }
-                
-                QPushButton#deleteButton {
-                    background-color: #e74c3c;
-                    color: white;
-                    font-size: 18px;
-                    font-weight: bold;
-                    padding: 0px;
-                    min-height: 0px;
-                    border-radius: 6px;
-                }
-                
-                QPushButton#deleteButton:hover {
-                    background-color: #c0392b;
-                }
-                
-                QPushButton#addModButton {
-                    background-color: #27ae60;
-                    color: white;
-                    font-size: 14px;
-                    font-weight: bold;
-                    padding: 6px 20px;
-                    border: 2px solid #2ecc71;
-                    border-radius: 8px;
-                    min-height: 28px;
-                }
-                
-                QPushButton#addModButton:hover {
-                    background-color: #2ecc71;
-                    border-color: #27ae60;
-                }
-                
-                QLabel#fileInfo {
-                    background-color: #f8f9fa;
-                    color: #2c3e50;
-                    padding: 15px;
-                    border-radius: 8px;
-                    border-left: 4px solid #3498db;
-                    font-size: 14px;
-                    font-weight: 500;
-                }
-                
-                QGroupBox {
-                    font-size: 16px;
-                    font-weight: bold;
-                    color: #3a506b;
-                    border: 1px dashed #d8e2e9;
-                    border-radius: 6px;
-                    margin-top: 15px;
-                    padding-top: 15px;
-                }
-                
-                QGroupBox::title {
-                    subcontrol-origin: margin;
-                    left: 10px;
-                    padding: 0 8px 0 8px;
-                    color: #3a506b;
-                }
-                
-                QLineEdit, QTextEdit {
-                    padding: 8px 15px;
-                    border: 1px solid #dce4ec;
-                    border-radius: 8px;
-                    font-size: 14px;
-                }
-                
-                QLineEdit:focus, QTextEdit:focus {
-                    border-color: #3498db;
-                    box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.2);
-                }
-                
-                QTextEdit {
-                    font-family: 'Consolas', 'Monaco', monospace;
-                }
-
-                QListWidget {
-                    background-color: white;
-                    color: #333333;
-                    border: 1px solid #dce4ec;
-                    border-radius: 8px;
-                    padding: 5px;
-                    outline: none;
-                }
-                
-                QListWidget::item {
-                    padding: 2px 0px;
-                    border: none;
-                }
-                
-                QListWidget::item:selected {
-                    background-color: transparent;
-                    color: #333333;
-                }
-                
-                QListWidget::item:hover {
-                    background-color: transparent;
-                }
-                
-                QScrollArea {
-                    border: none;
-                    background-color: transparent;
-                }
-                
-                QScrollBar:vertical {
-                    background-color: #f0f0f0;
-                    width: 10px;
-                    border-radius: 5px;
-                }
-                
-                QScrollBar::handle:vertical {
-                    background-color: #c0c0c0;
-                    border-radius: 5px;
-                    min-height: 20px;
-                }
-                
-                QScrollBar::handle:vertical:hover {
-                    background-color: #a0a0a0;
-                }
-
-                QMessageBox QPushButton {
-                    background-color: #27ae60;
-                    color: white;
-                    border-radius: 8px;
-                    padding: 8px 20px;
-                    min-width: 80px;
-                    min-height: 30px;
-                }
-                
-                QMessageBox QPushButton:hover {
-                    background-color: #1e8449;
-                }
-            """
-
-        self.setStyleSheet(stylesheet)
-
-    def open_file(self, fp=None):
-        """打开文件"""
-        if self.is_modified:
-            reply = QMessageBox.question(
-                self,
-                "未保存的更改",
-                "当前文件有未保存的更改，是否继续？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply == QMessageBox.No:
-                return
-
-        if fp:
-            file_path = fp
-        else:
-            file_path, _ = QFileDialog.getOpenFileName(
-                self,
-                "选择 ModPack",
-                "",
-                "ModPack Files (*.modpack *.json);;All Files (*)",
-            )
-
-        if not file_path:
-            return
-
-        try:
-            file_ext = os.path.splitext(file_path)[1].lower()
-            if file_ext not in [".json", ".modpack"]:
-                QMessageBox.critical(self, "错误", "此文件不是 JSON 或 .modpack 文件")
-                return
-
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            try:
-                json_data = json.loads(content)
-            except json.JSONDecodeError:
-                QMessageBox.critical(self, "错误", "此文件不是有效的 JSON 格式")
-                return
-
-            required_fields = ["name", "author", "version", "mod_list"]
-            missing_fields = [
-                field for field in required_fields if field not in json_data
-            ]
-
-            if missing_fields:
-                QMessageBox.critical(
-                    self,
-                    "错误",
-                    f'这不是一个标准的 ModPack,缺少字段: {", ".join(missing_fields)}',
-                )
-                return
-
-            try:
-                self.pack_name_input.setText(str(json_data.get("name", "")))
-                self.author_input.setText(str(json_data.get("author", "")))
-                self.version_input.setText(str(json_data.get("version", "")))
-
-                self.clear_mod_list()
-                self.add_add_button()
-
-                mod_list = json_data.get("mod_list", [])
-                if isinstance(mod_list, list):
-                    for mod in mod_list:
-                        if isinstance(mod, list):
-                            self.add_mod_item(", ".join([i.strip() for i in mod]))
-                        else:
-                            self.add_mod_item(str(mod).strip())
-
-                self.current_file = file_path
-                self.file_info.setText(f"当前打开文件: {os.path.basename(file_path)}")
-                self.file_info.show()
-                self.save_as_btn.show()
-                self.clear_modified()
-
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"读取文件内容时出错: {str(e)}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"打开文件时出错: {str(e)}")
-
-    def clear_mod_list(self):
-        """清空模组列表（保留加号按钮）"""
-        items_to_remove = []
-        for i in range(self.mods_list.count()):
-            item = self.mods_list.item(i)
-            if item and item.data(Qt.UserRole) != "add_button":
-                items_to_remove.append(i)
-
-        for i in reversed(items_to_remove):
-            self.mods_list.takeItem(i)
-
-    def add_mod_item(self, text=""):
-        """添加一个模组条目（在加号按钮前插入）"""
-        add_index = -1
-        for i in range(self.mods_list.count()):
-            item = self.mods_list.item(i)
-            if item and item.data(Qt.UserRole) == "add_button":
-                add_index = i
-                break
-
-        new_item = QListWidgetItem()
-        new_item.setData(Qt.UserRole, "mod_item")
-        new_widget = self.create_mod_item(text)
-        new_item.setSizeHint(QSize(new_widget.sizeHint().width(), 55))
-
-        if add_index >= 0:
-            self.mods_list.insertItem(add_index, new_item)
-        else:
-            self.mods_list.addItem(new_item)
-        self.mods_list.setItemWidget(new_item, new_widget)
-
-    def validate_form_data(self):
-        """验证表单数据"""
-        if not self.pack_name_input.text().strip():
-            QMessageBox.critical(self, "错误", "模组包名不能为空")
-            return False
-
-        if not self.author_input.text().strip():
-            QMessageBox.critical(self, "错误", "作者不能为空")
-            return False
-
-        if not self.version_input.text().strip():
-            QMessageBox.critical(self, "错误", "版本不能为空")
-            return False
-
-        return True
-
-    def collect_form_data(self):
-        """收集表单数据"""
-        mod_list = []
-        for i in range(self.mods_list.count()):
-            item = self.mods_list.item(i)
-            if item and item.data(Qt.UserRole) != "add_button":
-                widget = self.mods_list.itemWidget(item)
-                if widget:
-                    input_field = widget.findChild(QLineEdit)
-                    if input_field:
-                        text = input_field.text().strip()
-                        if text:
-                            text_split = [i.strip() for i in text.split(",")]
-                            if len(text_split) > 1:
-                                mod_list.append(text_split)
-                            else:
-                                mod_list.append(text)
-
-        return {
-            "name": self.pack_name_input.text().strip(),
-            "author": self.author_input.text().strip(),
-            "version": self.version_input.text().strip(),
-            "mod_list": mod_list,
-        }
-
-    def save_file(self):
-        """保存文件"""
-        if not self.validate_form_data():
-            return
-
-        data = self.collect_form_data()
-
-        if self.current_file:
-            try:
-                with open(self.current_file, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                self.clear_modified()
-                QMessageBox.information(self, "成功", "文件保存成功！")
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"保存文件时出错: {str(e)}")
-        else:
-            self.save_as_file()
-
-    def save_as_file(self):
-        """另存为文件"""
-        if not self.validate_form_data():
-            return
-
-        data = self.collect_form_data()
-
-        default_name = f"{data['name']}_{data['version']}.modpack"
-        default_name = "".join(
-            c if c.isalnum() or c in "._- " else "_" for c in default_name
+        # 打开 Editor
+        open_editor_layout = QHBoxLayout()
+        open_editor_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.open_editor_btn = QPushButton("打开 Editor")
+        self.open_editor_btn.setMinimumWidth(150)
+        self.open_editor_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        open_editor_layout.addWidget(self.open_editor_btn)
+        main_layout.addLayout(open_editor_layout)
+
+        # .modpack 路径选择
+        modpack_layout = QHBoxLayout()
+        modpack_layout.addWidget(QLabel(".modpack 文件路径:"))
+        self.modpack_entry = QLineEdit()
+        self.modpack_entry.setEnabled(False)
+        modpack_layout.addWidget(self.modpack_entry, 1)
+        self.modpack_btn = QPushButton("选择文件")
+        modpack_layout.addWidget(self.modpack_btn)
+        main_layout.addLayout(modpack_layout)
+
+        # 信息展示
+        info_frame = QFrame()
+        info_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        info_layout = QHBoxLayout(info_frame)
+
+        self.name_label = QLabel("名称: -")
+        info_layout.addWidget(self.name_label)
+        info_layout.addStretch()
+
+        self.author_label = QLabel("作者: -")
+        info_layout.addWidget(self.author_label)
+        info_layout.addStretch()
+
+        self.version_label = QLabel("版本: -")
+        info_layout.addWidget(self.version_label)
+        info_layout.addStretch()
+
+        self.view_list_btn = QPushButton("查看模组列表")
+        self.view_list_btn.setEnabled(False)
+        info_layout.addWidget(self.view_list_btn)
+
+        main_layout.addWidget(info_frame)
+
+        # 游戏版本
+        game_version_layout = QHBoxLayout()
+        game_version_layout.addWidget(QLabel("游戏版本:"))
+        self.game_version_entry = QLineEdit()
+        self.game_version_entry.setPlaceholderText("例如: 1.21.1")
+        game_version_layout.addWidget(self.game_version_entry)
+        main_layout.addLayout(game_version_layout)
+
+        # 加载器选择
+        loader_layout = QHBoxLayout()
+        loader_layout.addWidget(QLabel("加载器:"))
+        self.loader_combo = QComboBox()
+        self.loader_combo.addItems(["fabric", "forge", "quilt", "neoforge"])
+        loader_layout.addWidget(self.loader_combo)
+        loader_layout.addStretch()
+        main_layout.addLayout(loader_layout)
+
+        # 模组存储路径
+        save_dir_layout = QHBoxLayout()
+        save_dir_layout.addWidget(QLabel("模组存储路径:"))
+        self.save_dir_entry = QLineEdit()
+        self.save_dir_entry.setEnabled(False)
+        save_dir_layout.addWidget(self.save_dir_entry, 1)
+        self.save_dir_btn = QPushButton("选择文件夹")
+        save_dir_layout.addWidget(self.save_dir_btn)
+        main_layout.addLayout(save_dir_layout)
+
+        # ZIP 选项
+        self.zip_checkbox = QCheckBox("是否打包 ZIP")
+        main_layout.addWidget(self.zip_checkbox)
+
+        # 控制按钮
+        control_layout = QHBoxLayout()
+        control_layout.addStretch()
+        self.start_btn = QPushButton("开始下载")
+        self.start_btn.setMinimumWidth(120)
+        control_layout.addWidget(self.start_btn)
+
+        self.cancel_btn = QPushButton("取消下载")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setMinimumWidth(120)
+        control_layout.addWidget(self.cancel_btn)
+        control_layout.addStretch()
+        main_layout.addLayout(control_layout)
+
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        main_layout.addWidget(self.progress_bar)
+
+        # 状态栏
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setStyleSheet("color: #666;")
+        main_layout.addWidget(self.status_label)
+
+        # 开源仓库链接
+        repo_link_layout = QHBoxLayout()
+        repo_link_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.repo_link = QLabel(
+            '<a href="https://github.com/qiufengcute/Packnload" style="color: #0366d6; text-decoration: none;">开源仓库</a>'
         )
+        self.repo_link.setOpenExternalLinks(True)  # 允许点击打开外部链接
+        self.repo_link.setStyleSheet("font-size: 12px; padding: 5px;")
+        repo_link_layout.addWidget(self.repo_link)
+        main_layout.addLayout(repo_link_layout)
 
-        file_path, _ = QFileDialog.getSaveFileName(
+    def _connect_signals(self):
+        self.open_editor_btn.clicked.connect(self.open_editor)
+        self.modpack_btn.clicked.connect(self.choose_modpack)
+        self.save_dir_btn.clicked.connect(self.choose_save_dir)
+        self.view_list_btn.clicked.connect(self.view_mod_list)
+        self.start_btn.clicked.connect(self.start_or_pause)
+        self.cancel_btn.clicked.connect(self.cancel_download)
+
+    def open_editor(self):
+        # 检查 Editor 窗口是否存在且可见
+        if self.editor_window is None:
+            # Editor 窗口不存在 -> 创建新的 Editor 窗口
+            self.editor_window = PacknloadEditor()
+            self.editor_window.show()
+        elif self.editor_window.isVisible():
+            # Editor 窗口存在且可见 -> 激活它
+            self.editor_window.raise_()  # 置顶
+            self.editor_window.activateWindow()  # 获取焦点
+            # 如果窗口被最小化了，还原它
+            if self.editor_window.isMinimized():
+                self.editor_window.showNormal()
+        else:
+            # Editor 窗口隐藏了 -> 显示它
+            self.editor_window.show()
+
+    def choose_modpack(self):
+        path, _ = QFileDialog.getOpenFileName(
             self,
-            "另存为",
-            default_name,
-            "ModPack Files (*.modpack);;JSON Files (*.json);;All Files (*)",
+            "选择 .modpack 文件",
+            "",
+            "Modpack files (*.modpack);;All files (*.*)",
         )
+        if path:
+            self.modpack_entry.setText(path)
+            self.load_modpack_meta(path)
 
-        if not file_path:
+    def load_modpack_meta(self, path: str):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                pack = json.load(f)
+        except Exception:
+            self.pack_data = None
+            self.view_list_btn.setEnabled(False)
+            self.name_label.setText("名称: -")
+            self.author_label.setText("作者: -")
+            self.version_label.setText("版本: -")
+            QMessageBox.critical(self, "错误", "模组包格式错误！")
             return
 
-        try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+        required = ["name", "author", "version", "mod_list"]
+        if not all(k in pack for k in required) or not isinstance(
+            pack.get("mod_list"), list
+        ):
+            self.pack_data = None
+            self.view_list_btn.setEnabled(False)
+            self.name_label.setText("名称: -")
+            self.author_label.setText("作者: -")
+            self.version_label.setText("版本: -")
+            QMessageBox.critical(self, "错误", "模组包缺少必要字段或格式不正确！")
+            return
 
-            self.current_file = file_path
-            self.file_info.setText(f"当前打开文件: {os.path.basename(file_path)}")
-            self.file_info.show()
-            self.save_as_btn.show()
-            self.clear_modified()
+        # 清理 mod_list，保留嵌套结构
+        cleaned_mod_list = []
+        for item in pack["mod_list"]:
+            if isinstance(item, list):
+                # 清理列表中的空字符串和空白
+                cleaned_item = [
+                    m.strip() for m in item if isinstance(m, str) and m.strip()
+                ]
+                if cleaned_item:
+                    # 去重
+                    cleaned_mod_list.append(list(dict.fromkeys(cleaned_item)))
+            elif isinstance(item, str) and item.strip():
+                cleaned_mod_list.append(item.strip())
 
-            QMessageBox.information(
-                self, "成功", f"文件已另存为: {os.path.basename(file_path)}"
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"另存为文件时出错: {str(e)}")
+        pack["mod_list"] = cleaned_mod_list
+
+        self.pack_data = pack
+        self.name_label.setText(f"名称: {pack['name']}")
+        self.author_label.setText(f"作者: {pack['author']}")
+        self.version_label.setText(f"版本: {pack['version']}")
+        self.view_list_btn.setEnabled(True)
+
+    def view_mod_list(self):
+        if not self.pack_data:
+            return
+
+        dialog = QMainWindow(self)
+        dialog.setWindowTitle("模组列表")
+        dialog.setMinimumSize(420, 360)
+
+        central = QWidget()
+        dialog.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        list_widget = QListWidget()
+        for modid in self.pack_data.get("mod_list", []):
+            if isinstance(modid, list):
+                # 如果是列表，显示为 mod1/mod2 格式
+                display_text = "/".join(modid)
+            else:
+                # 如果是字符串，直接显示
+                display_text = str(modid)
+            list_widget.addItem(display_text)
+        layout.addWidget(list_widget)
+
+        dialog.show()
+
+    def choose_save_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "选择存储路径")
+        if path:
+            self.save_dir_entry.setText(path)
+
+    def start_or_pause(self):
+        text = self.start_btn.text()
+        if text == "开始下载":
+            self.start_download()
+        elif text == "暂停下载":
+            if self.worker:
+                is_paused = self.worker.toggle_pause()
+                self.start_btn.setText("继续下载" if is_paused else "暂停下载")
+                self.status_label.setText("已暂停" if is_paused else "继续下载…")
+        elif text == "继续下载":
+            if self.worker:
+                is_paused = self.worker.toggle_pause()
+                self.start_btn.setText("暂停下载")
+                self.status_label.setText("继续下载…")
+
+    def cancel_download(self):
+        if self.worker and self.worker.isRunning():
+            self.cancel_btn.setEnabled(False)
+            self.start_btn.setEnabled(False)
+            self.worker.cancel()
+            self.status_label.setText("取消中…")
+
+    def start_download(self):
+        modpack_path = self.modpack_entry.text().strip()
+        game_version = self.game_version_entry.text().strip()
+        loader = self.loader_combo.currentText()
+        save_dir = self.save_dir_entry.text().strip()
+        zip_enabled = self.zip_checkbox.isChecked()
+
+        # 基本校验
+        if not os.path.isfile(modpack_path):
+            QMessageBox.critical(self, "错误", "请正确选择 .modpack 文件")
+            return
+        if not game_version:
+            QMessageBox.critical(self, "错误", "请输入游戏版本")
+            return
+        if not os.path.isdir(save_dir):
+            QMessageBox.critical(self, "错误", "请选择有效的模组存储路径")
+            return
+
+        self.worker = DownloadWorker(
+            modpack_path, game_version, loader, save_dir, zip_enabled
+        )
+        self.worker.progress_updated.connect(self.update_progress)
+        self.worker.status_updated.connect(self.update_status)
+        self.worker.download_finished.connect(self.on_download_finished)
+
+        self.start_btn.setText("暂停下载")
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("开始下载…")
+
+        self.worker.start()
+
+    def update_progress(self, value):
+        self.progress_bar.setValue(int(value))
+
+    def update_status(self, text):
+        self.status_label.setText(text)
+
+    def on_download_finished(self, success, fails, pack_name, pack_version):
+        self.start_btn.setText("开始下载")
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+
+        if not success:
+            return
+
+        if fails:
+            dialog = QMainWindow(self)
+            dialog.setWindowTitle("下载失败模组列表")
+            dialog.setMinimumSize(400, 300)
+
+            central = QWidget()
+            dialog.setCentralWidget(central)
+            layout = QVBoxLayout(central)
+
+            info_label = QLabel(f"成功下载!\n其中 {len(fails)} 个模组下载失败:")
+            layout.addWidget(info_label)
+
+            list_widget = QListWidget()
+            for fail_group in fails:
+                if isinstance(fail_group, list):
+                    # 显示为 mod1/mod2 格式
+                    display_text = "/".join(fail_group)
+                else:
+                    display_text = str(fail_group)
+                list_widget.addItem(display_text)
+            layout.addWidget(list_widget)
+
+            dialog.show()
+        else:
+            QMessageBox.information(self, "完成", "成功下载!\n没有任何模组下载失败!")
 
     def closeEvent(self, event):
-        """关闭事件 - 检查是否有未保存的修改"""
-        if not event.spontaneous() and not isAlone and self.is_modified:
+        if self.editor_window is not None:
+            if self.editor_window.is_modified:
+                self.editor_window.show()
+            self.editor_window.close()
+
+            # 检查 Editor 窗口是否还在显示（用户可能点击了Cancel）
+            if self.editor_window.isVisible():
+                # 用户取消了 Editor 窗口的关闭
+                reply = QMessageBox.information(
+                    self,
+                    "操作取消",
+                    "Editor 窗口的关闭操作被取消",
+                    QMessageBox.StandardButton.Ok,
+                )
+                event.ignore()  # 取消A的关闭
+                return
+
+        if self.worker and self.worker.isRunning():
             reply = QMessageBox.question(
                 self,
-                "未保存的更改",
-                "文件尚未保存，是否保存？",
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                QMessageBox.Save,
+                "确认退出",
+                "下载正在进行中，确定要退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-
-            if reply == QMessageBox.Save:
-                self.save_file()
-                if self.is_modified:
-                    event.ignore()
-                    return
-            elif reply == QMessageBox.Cancel:
+            if reply == QMessageBox.StandardButton.Yes:
+                self.worker.cancel()
+                self.worker.wait()
+                event.accept()
+            else:
                 event.ignore()
-
-        if isAlone:
-            event.accept()
         else:
-            self.hide()
-            event.ignore()  # 忽略真正的关闭，改为隐藏
+            event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-
-    font = QFont("Segoe UI", 10)
-    app.setFont(font)
-
-    window = PacknloadEditor()
-    if len(sys.argv) > 1:
-        fp = sys.argv[1]
-        if os.path.exists(fp):
-            window.open_file(fp)
+    window = MainWindow()
     window.show()
-
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    isAlone = True
     main()
