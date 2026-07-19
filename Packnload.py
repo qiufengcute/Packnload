@@ -7,14 +7,10 @@ import threading
 import zipfile
 
 import requests
+from PacknloadEditor import PacknloadEditor
 from PySide6.QtCore import (
-    Q_ARG,
-    QEventLoop,
-    QMetaObject,
-    QRect,
     Qt,
     QThread,
-    QTimer,
     Signal,
 )
 from PySide6.QtGui import QFont, QIcon
@@ -24,18 +20,14 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -43,7 +35,7 @@ from PySide6.QtWidgets import (
 APP_TITLE = "Packnload"
 ICON_IMG = "icon.ico"
 BASE_URL = "https://api.modrinth.com/v2"
-UA = {"User-Agent": "Packnload/1.1 (+https://modrinth.com/)"}
+UA = {"User-Agent": "Packnload/1.2 (+https://modrinth.com/)"}
 
 
 # ---------- Modrinth API helpers ----------
@@ -351,6 +343,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        self.editor_window = None
         self.worker = None
         self.pack_data = None
 
@@ -370,6 +363,31 @@ class MainWindow(QMainWindow):
         title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(title_label)
+
+        # 打开 Editor
+        open_editor_layout = QHBoxLayout()
+        open_editor_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.open_editor_btn = QPushButton("打开 Editor")
+        self.open_editor_btn.setMinimumWidth(150)
+        self.open_editor_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        open_editor_layout.addWidget(self.open_editor_btn)
+        main_layout.addLayout(open_editor_layout)
 
         # .modpack 路径选择
         modpack_layout = QHBoxLayout()
@@ -460,12 +478,42 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: #666;")
         main_layout.addWidget(self.status_label)
 
+        # 开源仓库链接
+        repo_link_layout = QHBoxLayout()
+        repo_link_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.repo_link = QLabel(
+            '<a href="https://github.com/qiufengcute/Packnload" style="color: #0366d6; text-decoration: none;">开源仓库</a>'
+        )
+        self.repo_link.setOpenExternalLinks(True)  # 允许点击打开外部链接
+        self.repo_link.setStyleSheet("font-size: 12px; padding: 5px;")
+        repo_link_layout.addWidget(self.repo_link)
+        main_layout.addLayout(repo_link_layout)
+
     def _connect_signals(self):
+        self.open_editor_btn.clicked.connect(self.open_editor)
         self.modpack_btn.clicked.connect(self.choose_modpack)
         self.save_dir_btn.clicked.connect(self.choose_save_dir)
         self.view_list_btn.clicked.connect(self.view_mod_list)
         self.start_btn.clicked.connect(self.start_or_pause)
         self.cancel_btn.clicked.connect(self.cancel_download)
+
+    def open_editor(self):
+        # 检查 Editor 窗口是否存在且可见
+        if self.editor_window is None:
+            # Editor 窗口不存在 -> 创建新的 Editor 窗口
+            self.editor_window = PacknloadEditor()
+            self.editor_window.show()
+        elif self.editor_window.isVisible():
+            # Editor 窗口存在且可见 -> 激活它
+            self.editor_window.raise_()  # 置顶
+            self.editor_window.activateWindow()  # 获取焦点
+            # 如果窗口被最小化了，还原它
+            if self.editor_window.isMinimized():
+                self.editor_window.showNormal()
+        else:
+            # Editor 窗口隐藏了 -> 显示它
+            self.editor_window.show()
 
     def choose_modpack(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -473,7 +521,6 @@ class MainWindow(QMainWindow):
             "选择 .modpack 文件",
             "",
             "Modpack files (*.modpack);;All files (*.*)",
-            options=QFileDialog.DontUseNativeDialog,
         )
         if path:
             self.modpack_entry.setText(path)
@@ -552,9 +599,7 @@ class MainWindow(QMainWindow):
         dialog.show()
 
     def choose_save_dir(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "选择存储路径", options=QFileDialog.DontUseNativeDialog
-        )
+        path = QFileDialog.getExistingDirectory(self, "选择存储路径")
         if path:
             self.save_dir_entry.setText(path)
 
@@ -654,6 +699,23 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "完成", "成功下载!\n没有任何模组下载失败!")
 
     def closeEvent(self, event):
+        if self.editor_window is not None:
+            if self.editor_window.is_modified:
+                self.editor_window.show()
+            self.editor_window.close()
+
+            # 检查 Editor 窗口是否还在显示（用户可能点击了Cancel）
+            if self.editor_window.isVisible():
+                # 用户取消了 Editor 窗口的关闭
+                reply = QMessageBox.information(
+                    self,
+                    "操作取消",
+                    "Editor 窗口的关闭操作被取消",
+                    QMessageBox.StandardButton.Ok,
+                )
+                event.ignore()  # 取消A的关闭
+                return
+
         if self.worker and self.worker.isRunning():
             reply = QMessageBox.question(
                 self,
