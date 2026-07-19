@@ -18,10 +18,11 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+isAlone = False
 
 
 class PacknloadEditor(QMainWindow):
@@ -59,19 +60,6 @@ class PacknloadEditor(QMainWindow):
         title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title_label)
-
-        # 关于链接
-        self.about_label = QLabel()
-        self.about_label.setOpenExternalLinks(True)
-        self.about_label.setText(
-            "<a href='https://qiufengcute.github.io/Blog/posts/Packnload/'>关于 Packnload</a>"
-        )
-        self.about_label.setAlignment(Qt.AlignCenter)
-        font = QFont()
-        font.setPointSize(20)
-        font.setBold(True)
-        self.about_label.setFont(font)
-        main_layout.addWidget(self.about_label)
 
         # 主容器
         container = QWidget()
@@ -128,7 +116,7 @@ class PacknloadEditor(QMainWindow):
         version_layout.addWidget(self.version_input)
         container_layout.addWidget(version_group)
 
-        # 模组列表 - 使用 QListWidget
+        # 模组列表
         mods_group = QGroupBox("模组")
         mods_group.setObjectName("modsGroup")
         mods_layout = QVBoxLayout(mods_group)
@@ -245,7 +233,7 @@ class PacknloadEditor(QMainWindow):
         delete_btn.setCursor(Qt.PointingHandCursor)
         delete_btn.clicked.connect(lambda: self.delete_mod_item(item_widget))
 
-        # 输入框 - 加长
+        # 输入框
         input_field = QLineEdit()
         input_field.setText(text)
         input_field.setObjectName("modInput")
@@ -332,16 +320,7 @@ class PacknloadEditor(QMainWindow):
 
         if is_dark:
             stylesheet = f"""
-                QMainWindow {{
-                    background-color: {palette.color(QPalette.Window).name()};
-                }}
-                
-                QLabel {{
-                    color: {palette.color(QPalette.WindowText).name()};
-                }}
-                
                 QWidget#container {{
-                    background-color: {palette.color(QPalette.Base).name()};
                     border-radius: 12px;
                 }}
                 
@@ -403,8 +382,7 @@ class PacknloadEditor(QMainWindow):
                 }}
                 
                 QLabel#fileInfo {{
-                    background-color: {palette.color(QPalette.AlternateBase).name()};
-                    color: {palette.color(QPalette.WindowText).name()};
+                    background-color: rgba(255, 255, 255, 0.08);
                     padding: 15px;
                     border-radius: 8px;
                     border-left: 4px solid #2980b9;
@@ -414,7 +392,6 @@ class PacknloadEditor(QMainWindow):
                 QGroupBox {{
                     font-size: 16px;
                     font-weight: bold;
-                    color: {palette.color(QPalette.WindowText).name()};
                     border: 1px dashed #555555;
                     border-radius: 6px;
                     margin-top: 10px;
@@ -425,12 +402,9 @@ class PacknloadEditor(QMainWindow):
                     subcontrol-origin: margin;
                     left: 10px;
                     padding: 0 5px 0 5px;
-                    color: {palette.color(QPalette.WindowText).name()};
                 }}
-                
+
                 QLineEdit, QTextEdit {{
-                    background-color: {palette.color(QPalette.Base).name()};
-                    color: {palette.color(QPalette.Text).name()};
                     padding: 8px 15px;
                     border: 1px solid #444444;
                     border-radius: 8px;
@@ -448,8 +422,6 @@ class PacknloadEditor(QMainWindow):
                 }}
 
                 QListWidget {{
-                    background-color: {palette.color(QPalette.Base).name()};
-                    color: {palette.color(QPalette.Text).name()};
                     border: 1px solid #444444;
                     border-radius: 8px;
                     padding: 5px;
@@ -463,7 +435,6 @@ class PacknloadEditor(QMainWindow):
                 
                 QListWidget::item:selected {{
                     background-color: transparent;
-                    color: {palette.color(QPalette.Text).name()};
                 }}
                 
                 QListWidget::item:hover {{
@@ -746,7 +717,10 @@ class PacknloadEditor(QMainWindow):
                 mod_list = json_data.get("mod_list", [])
                 if isinstance(mod_list, list):
                     for mod in mod_list:
-                        self.add_mod_item(str(mod))
+                        if isinstance(mod, list):
+                            self.add_mod_item(", ".join([i.strip() for i in mod]))
+                        else:
+                            self.add_mod_item(str(mod).strip())
 
                 self.current_file = file_path
                 self.file_info.setText(f"当前打开文件: {os.path.basename(file_path)}")
@@ -783,6 +757,7 @@ class PacknloadEditor(QMainWindow):
         new_item = QListWidgetItem()
         new_item.setData(Qt.UserRole, "mod_item")
         new_widget = self.create_mod_item(text)
+        new_item.setSizeHint(QSize(new_widget.sizeHint().width(), 55))
 
         if add_index >= 0:
             self.mods_list.insertItem(add_index, new_item)
@@ -818,7 +793,7 @@ class PacknloadEditor(QMainWindow):
                     if input_field:
                         text = input_field.text().strip()
                         if text:
-                            text_split = text.split(",")
+                            text_split = [i.strip() for i in text.split(",")]
                             if len(text_split) > 1:
                                 mod_list.append(text_split)
                             else:
@@ -889,7 +864,7 @@ class PacknloadEditor(QMainWindow):
 
     def closeEvent(self, event):
         """关闭事件 - 检查是否有未保存的修改"""
-        if self.is_modified:
+        if not event.spontaneous() and not isAlone and self.is_modified:
             reply = QMessageBox.question(
                 self,
                 "未保存的更改",
@@ -903,13 +878,14 @@ class PacknloadEditor(QMainWindow):
                 if self.is_modified:
                     event.ignore()
                     return
-                event.accept()
-            elif reply == QMessageBox.Discard:
-                event.accept()
-            else:
+            elif reply == QMessageBox.Cancel:
                 event.ignore()
-        else:
+
+        if isAlone:
             event.accept()
+        else:
+            self.hide()
+            event.ignore()  # 忽略真正的关闭，改为隐藏
 
 
 def main():
@@ -930,4 +906,5 @@ def main():
 
 
 if __name__ == "__main__":
+    isAlone = True
     main()
